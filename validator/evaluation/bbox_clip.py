@@ -16,6 +16,7 @@ from transformers import CLIPProcessor, CLIPModel
 from cv2 import VideoCapture
 from torch import no_grad
 import torch
+from typing import List, Dict
 
 SCALE_FOR_CLIP = 4.0
 FRAMES_PER_VIDEO = 750
@@ -26,6 +27,14 @@ logger = getLogger("Bounding Box Evaluation Pipeline")
 clip_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(clip_device)
 data_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+# 1. Load model với torch.compile (PyTorch 2.0+)
+# Compile model để tăng tốc (nếu PyTorch >= 2.0)
+# try:
+#     torch.set_float32_matmul_precision('high')
+#     clip_model = torch.compile(clip_model)
+# except:
+#     print("torch.compile not available, using regular model")
 
 class BoundingBoxObject(Enum):
     #possible classifications identified by miners and CLIP
@@ -85,8 +94,7 @@ predicted: {self.predicted_label.value}
     def validity(self) -> bool:
         """Is the Object captured by the Miner
         a valid object of interest (e.g. player, goalkeeper, football, ref)
-        or is it another object we don't care about?""
-        """
+        or is it another object we don't care about?"""
         return self.expected_label in OBJECT_ID_TO_ENUM.values()
 
     @property
@@ -481,6 +489,8 @@ def evaluate_frame_filter(
     image_array:ndarray,
     bboxes:list[dict[str,int|tuple[int,int,int,int]]]
 ):
+    import time
+    start_time = time.time()
     bboxes = [bbox for bbox in bboxes if is_bbox_large_enough(bbox) and not is_touching_scoreboard_zone(bbox, image_array.shape[1], image_array.shape[0])]
     if not bboxes:
         logger.info(f"Frame {frame_id}: all bboxes filtered out due to small size or corners — skipping.")
@@ -649,6 +659,8 @@ def evaluate_frame_filter(
     correct = [bbox for bbox, score in keep if score.predicted_label.value == score.expected_label.value]
     incorrect = [bbox for bbox, score in keep if score.predicted_label.value != score.expected_label.value]
     keep_sorted = correct + incorrect
+    elapsed = time.time() - start_time
+    print(f"evaluate_frame_filter: frame {frame_id} processed in {elapsed:.3f} seconds")
     return keep_sorted
 
 async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_valid:int) -> float:
@@ -716,3 +728,108 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
     average_score = sum(scores)/len(scores) if scores else 0.0
     logger.info(f"Average Score: {average_score:.2f} when evaluated on {len(scores)} frames")
     return max(0.0,min(1.0,round(average_score,2)))
+
+import numpy as np
+import time
+
+def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = 256):
+    import time
+    t0 = time.time()
+    # 1. Gom tất cả ROI và mapping
+    all_rois = []
+    roi_map = []  # (frame_idx, obj_idx, bbox_dict)
+    total_bboxes = 0
+    total_valid_bboxes = 0
+    total_valid_rois = 0
+    for frame_idx, frame_data in enumerate(frames):
+        bboxes = frame_data.get("objects", [])
+        total_bboxes += len(bboxes)
+        valid_bboxes = [bbox for bbox in bboxes if is_bbox_large_enough(bbox) and not is_touching_scoreboard_zone(bbox, images[frame_idx].shape[1], images[frame_idx].shape[0])]
+        total_valid_bboxes += len(valid_bboxes)
+        if not valid_bboxes:
+            continue
+        rois = extract_regions_of_interest_from_image(
+            bboxes=valid_bboxes,
+            image_array=images[frame_idx][:,:,::-1]  # BGR -> RGB
+        )
+        for obj_idx, (roi, bbox) in enumerate(zip(rois, valid_bboxes)):
+            if roi is not None and roi.shape[0] > 0 and roi.shape[1] > 0:
+                all_rois.append(roi)
+                roi_map.append((frame_idx, obj_idx, bbox))
+                total_valid_rois += 1
+    print(f"Total frames: {len(frames)} | Total bboxes: {total_bboxes} | Valid bboxes: {total_valid_bboxes} | Valid ROIs: {total_valid_rois}")
+    t1 = time.time(); print(f"[TIMING] ROI gathering: {t1-t0:.3f}s")
+
+    # 2. Gộp step1 và step3: gọi CLIP một lần với nhiều class
+    t2 = time.time()
+    all_labels = [
+        BoundingBoxObject.PLAYER.value,      # 0
+        BoundingBoxObject.GOALKEEPER.value, # 1
+        BoundingBoxObject.REFEREE.value,    # 2
+        BoundingBoxObject.CROWD.value,      # 3
+        BoundingBoxObject.BLACK.value,      # 4
+        BoundingBoxObject.GRASS.value,      # 5
+        BoundingBoxObject.FOOTBALL.value,   # 6
+        BoundingBoxObject.NOTFOOT.value,    # 7
+        BoundingBoxObject.BACKGROUND.value, # 8
+        BoundingBoxObject.OTHER.value       # 9
+    ]
+    index_to_enum = {
+        0: BoundingBoxObject.PLAYER,
+        1: BoundingBoxObject.GOALKEEPER,
+        2: BoundingBoxObject.REFEREE,
+        3: BoundingBoxObject.CROWD,
+        4: BoundingBoxObject.BLACK,
+        5: BoundingBoxObject.GRASS,
+        6: BoundingBoxObject.FOOTBALL,
+        7: BoundingBoxObject.NOTFOOT,
+        8: BoundingBoxObject.BACKGROUND,
+        9: BoundingBoxObject.OTHER
+    }
+    all_probs = []
+    for i in range(0, len(all_rois), batch_size):
+        batch_rois = all_rois[i:i+batch_size]
+        model_inputs = data_processor(
+            text=all_labels,
+            images=batch_rois,
+            return_tensors="pt",
+            padding=True
+        ).to(clip_device)
+        with torch.no_grad():
+            model_outputs = clip_model(**model_inputs)
+            probs = model_outputs.logits_per_image.softmax(dim=1)
+        all_probs.append(probs.cpu())
+    all_probs = torch.cat(all_probs, dim=0)
+    pred_indices = all_probs.argmax(dim=1)
+    expected_labels = [index_to_enum[idx.item()] for idx in pred_indices]
+    t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
+
+    # 3. Tính điểm và filter như cũ
+    t4 = time.time()
+    predicted_labels = [OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER) for _, _, bbox in roi_map]
+    frame_results = [{} for _ in frames]
+    frame_label_count = [{} for _ in frames]  # Đếm occurrence cho từng expected_label trong từng frame
+    for idx, (frame_idx, obj_idx, bbox) in enumerate(roi_map):
+        predicted = predicted_labels[idx]
+        expected = expected_labels[idx]
+        label_count = frame_label_count[frame_idx].get(expected, 0)
+        score = BBoxScore(
+            predicted_label=predicted,
+            expected_label=expected,
+            occurrence=label_count
+        )
+        if score.points > 0.0:
+            if score.expected_label in EXPECTED_LABEL_TO_CLASS_ID:
+                bbox["class_id"] = EXPECTED_LABEL_TO_CLASS_ID[score.expected_label]
+            if "objects" not in frame_results[frame_idx]:
+                frame_results[frame_idx]["objects"] = []
+            frame_results[frame_idx]["objects"].append(bbox)
+            frame_label_count[frame_idx][expected] = label_count + 1
+    t5 = time.time(); print(f"[TIMING] Assign results to frames: {t5-t4:.3f}s")
+
+    # Giữ nguyên các frame không có object
+    for i, frame_data in enumerate(frames):
+        if not frame_results[i] or not frame_results[i].get("objects"):
+            frame_results[i] = {"objects": []}
+    print(f"[TIMING] Total batch_evaluate_frame_filter: {time.time()-t0:.3f}s")
+    return frame_results

@@ -29,6 +29,7 @@ from supervision.keypoint.core import KeyPoints
 from validator.evaluation.bbox_clip import batch_classify_rois as orig_batch_classify_rois, BoundingBoxObject, OBJECT_ID_TO_ENUM, BBoxScore, extract_regions_of_interest_from_image
 import torch
 from validator.evaluation.bbox_clip import evaluate_frame,evaluate_frame_filter
+from validator.evaluation.bbox_clip import batch_evaluate_frame_filter
 
 # Override batch_classify_rois để dùng GPU nếu có
 
@@ -91,6 +92,8 @@ def scale_keypoints_between_sizes(keypoints, from_size, to_size):
 async def process_soccer_video(
     video_path: str,
     model_manager: ModelManager,
+    filter_type: str = 'batch',  # Thêm tham số để chọn logic filter
+    filter_enabled: bool = True
 ) -> Dict[str, Any]:
     """Process a soccer video and return tracking data (batch optimized)."""
     import math
@@ -166,7 +169,7 @@ async def process_soccer_video(
                 frame_data = {
                     "frame_number": int(frame_number),
                     "objects": objects,
-                    "frame": batch_frames_resized[j],  # frame đã resize
+                    "frame": frame,  # frame đã resize
                     "orig_shape": (orig_width, orig_height),
                     "resize_shape": (resize_width, resize_height)
                 }
@@ -206,16 +209,29 @@ async def process_soccer_video(
                         if attempt < max_retries - 1:
                             time.sleep(0.1 * (attempt + 1))  # Exponential backoff
                         else:
-                            print(f"Skip frame {frame_data['frame_number']} due to tokenizer lock after {max_retries} retries")
+                            print("Skip frame {} due to tokenizer lock after {} retries".format(frame_data['frame_number'], max_retries))
                             frame_data["objects"] = []
                             return frame_data
                     else:
                         raise
             return frame_data
         import concurrent.futures
-        args_list = [(fd, frames[fd["frame_number"]][1]) for fd in tracking_data["frames"]]  # frame gốc
-        with concurrent.futures.ThreadPoolExecutor(max_workers=84) as executor:
-            tracking_data["frames"] = list(executor.map(filter_objects_clip_frame, args_list))
+        if filter_type == 'batch':
+            frames = tracking_data["frames"]
+            # Lấy ảnh gốc đúng thứ tự frame_number
+            images = []
+            for fd in frames:
+                if "frame" in fd:
+                    images.append(fd["frame"])
+                else:
+                    raise ValueError(f"Frame {fd['frame_number']} missing 'frame' key for batch CLIP filtering.")
+            filtered_frames = batch_evaluate_frame_filter(frames, images, batch_size=1024)
+            for i, frame_data in enumerate(filtered_frames):
+                tracking_data["frames"][i]["objects"] = frame_data["objects"]
+        else:
+            args_list = [(fd, frames[fd["frame_number"]][1]) for fd in tracking_data["frames"]]  # frame gốc
+            with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
+                tracking_data["frames"] = list(executor.map(filter_objects_clip_frame, args_list))
         t_clip_end = time.time()
         timings['clip_filtering'] = t_clip_end - t_clip_start
         # 6. Generate keypoint và fake object (trên bbox đã scale)
@@ -293,13 +309,13 @@ async def process_soccer_video(
         # Print/log timings for each step
         print("--- Pipeline Step Timings (seconds) ---")
         for step, duration in timings.items():
-            print(f"{step}: {duration:.2f}s")
+            print("{}: {:.2f}s".format(step, duration))
         print("--------------------------------------")
 
         fps = total_frames / processing_time if processing_time > 0 else 0
         logger.info(
-            f"Completed processing {total_frames} frames in {processing_time:.1f}s "
-            f"({fps:.2f} fps) on {model_manager.device} device"
+            "Completed processing {} frames in {:.1f}s "
+            "({:.2f} fps) on {} device".format(total_frames, processing_time, fps, model_manager.device)
         )
         return tracking_data
     except Exception as e:

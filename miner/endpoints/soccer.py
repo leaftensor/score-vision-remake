@@ -128,14 +128,15 @@ async def process_soccer_video(
         batch_size = 10  # Có thể điều chỉnh tùy GPU
         total_frames = len(frames)
         frames_with_objects = set()
-        # 2. Batch inference
+        # 2. Detect object trên frame đã resize
         t_infer_start = time.time()
         for i in range(0, total_frames, batch_size):
             batch_tuples = frames[i:i+batch_size]
             batch_indices = [t[0] for t in batch_tuples]
             batch_frames = [t[1] for t in batch_tuples]
             orig_height, orig_width = batch_frames[0].shape[:2]
-            batch_frames_resized = [cv2.resize(frame, (640, 360)) for frame in batch_frames]
+            resize_width, resize_height = 640, 360
+            batch_frames_resized = [cv2.resize(frame, (resize_width, resize_height)) for frame in batch_frames]
             player_results = player_model(batch_frames_resized, verbose=False)
             for j, (frame_number, frame) in enumerate(batch_tuples):
                 player_result = player_results[j]
@@ -151,13 +152,10 @@ async def process_soccer_video(
                     and len(tracker_ids) == len(xyxys) == len(class_ids)
                 ):
                     for tracker_id, bbox, class_id in zip(tracker_ids.tolist(), xyxys.tolist(), class_ids.tolist()):
-                        if orig_width > 640 and orig_height > 380:
-                            bbox_scaled = scale_bbox_between_sizes(bbox, (640, 360), (orig_width, orig_height))
-                        else:
-                            bbox_scaled = bbox
+                        # Không scale bbox ở đây, giữ bbox theo frame đã resize
                         objects.append({
                             "id": int(tracker_id),
-                            "bbox": [float(x) for x in bbox_scaled],
+                            "bbox": [float(x) for x in bbox],
                             "class_id": int(class_id)
                         })
                 
@@ -165,21 +163,62 @@ async def process_soccer_video(
                     frames_with_objects.add(frame_number)
                 else:
                     empty_object_frame_ids.append(frame_number)
-                # Nếu không có object nào, fake object cầu thủ và trọng tài (tạm thời chưa thêm ở đây)
-                keypoints_list = []
-                if not keypoints_list:
-                    keypoints_list = generate_perfect_keypoints(video_width=orig_width, video_height=orig_height)
                 frame_data = {
                     "frame_number": int(frame_number),
-                    "keypoints": keypoints_list,
                     "objects": objects,
-                    "frame": frame
+                    "frame": batch_frames_resized[j],  # frame đã resize
+                    "orig_shape": (orig_width, orig_height),
+                    "resize_shape": (resize_width, resize_height)
                 }
                 tracking_data["frames"].append(frame_data)
         t_infer_end = time.time()
         timings['batch_inference'] = t_infer_end - t_infer_start
 
-        # 3. Fake object generation
+        # 4. Scale bbox về kích thước gốc trước khi filter CLIP
+        for frame_data in tracking_data["frames"]:
+            if not isinstance(frame_data["objects"], list):
+                frame_data["objects"] = []
+            orig_width, orig_height = frame_data["orig_shape"]
+            resize_width, resize_height = frame_data["resize_shape"]
+            for obj in frame_data["objects"]:
+                obj["bbox"] = scale_bbox_between_sizes(obj["bbox"], (resize_width, resize_height), (orig_width, orig_height))
+        # 5. CLIP-based filtering trên frame gốc và bbox gốc
+        t_clip_start = time.time()
+        def filter_objects_clip_frame(args):
+            frame_data, frame_orig = args
+            bboxes = frame_data.get("objects", [])
+            if not bboxes:
+                return frame_data
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    keep = evaluate_frame_filter(
+                        frame_id=frame_data["frame_number"],
+                        image_array=frame_orig,  # frame gốc
+                        bboxes=bboxes       # bbox đã scale về gốc
+                    )
+                    if not isinstance(keep, list):
+                        keep = []
+                    frame_data["objects"] = keep
+                    return frame_data
+                except RuntimeError as e:
+                    if "Already borrowed" in str(e):
+                        if attempt < max_retries - 1:
+                            time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                        else:
+                            print(f"Skip frame {frame_data['frame_number']} due to tokenizer lock after {max_retries} retries")
+                            frame_data["objects"] = []
+                            return frame_data
+                    else:
+                        raise
+            return frame_data
+        import concurrent.futures
+        args_list = [(fd, frames[fd["frame_number"]][1]) for fd in tracking_data["frames"]]  # frame gốc
+        with concurrent.futures.ThreadPoolExecutor(max_workers=84) as executor:
+            tracking_data["frames"] = list(executor.map(filter_objects_clip_frame, args_list))
+        t_clip_end = time.time()
+        timings['clip_filtering'] = t_clip_end - t_clip_start
+        # 6. Generate keypoint và fake object (trên bbox đã scale)
         t_fake_start = time.time()
         min_frames_with_objects = int(0.7 * total_frames)
         current_with_objects = len(frames_with_objects)
@@ -229,47 +268,20 @@ async def process_soccer_video(
                     frame_data["objects"] = fake_objects
         t_fake_end = time.time()
         timings['fake_object_generation'] = t_fake_end - t_fake_start
-
-        # 4. CLIP-based filtering
-        t_clip_start = time.time()
-        def filter_objects_clip_frame(args):
-            frame_data, frame = args
-            bboxes = frame_data.get("objects", [])
-            if not bboxes:
-                return frame_data
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    keep = evaluate_frame_filter(
-                        frame_id=frame_data["frame_number"],
-                        image_array=frame,
-                        bboxes=bboxes
-                    )
-                    frame_data["objects"] = keep
-                    return frame_data
-                except RuntimeError as e:
-                    if "Already borrowed" in str(e):
-                        if attempt < max_retries - 1:
-                            time.sleep(0.1 * (attempt + 1))  # Exponential backoff
-                        else:
-                            print(f"Skip frame {frame_data['frame_number']} due to tokenizer lock after {max_retries} retries")
-                            frame_data["objects"] = []
-                            return frame_data
-                    else:
-                        raise
-            return frame_data
-        import concurrent.futures
-        args_list = [(fd, fd["frame"]) for fd in tracking_data["frames"]]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
-            tracking_data["frames"] = list(executor.map(filter_objects_clip_frame, args_list))
-        t_clip_end = time.time()
-        timings['clip_filtering'] = t_clip_end - t_clip_start
-
-        # 5. Result aggregation/cleanup
+        # 7. Generate keypoints (nên làm sau khi bbox đã scale)
+        for frame_data in tracking_data["frames"]:
+            orig_width, orig_height = frame_data["orig_shape"]
+            keypoints_list = generate_perfect_keypoints(video_width=orig_width, video_height=orig_height)
+            frame_data["keypoints"] = keypoints_list
+        # 8. Result aggregation/cleanup
         t_agg_start = time.time()
         for frame_data in tracking_data["frames"]:
             if "frame" in frame_data:
                 del frame_data["frame"]
+            if "orig_shape" in frame_data:
+                del frame_data["orig_shape"]
+            if "resize_shape" in frame_data:
+                del frame_data["resize_shape"]
         t_agg_end = time.time()
         timings['result_aggregation'] = t_agg_end - t_agg_start
 

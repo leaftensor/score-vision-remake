@@ -226,3 +226,44 @@ For advanced configuration options and architecture details, see the [main READM
 A big shout out to Skalskip and the work they're doing over at Roboflow. The base miner utilizes models and techniques from:
 
 - [Roboflow Sports](https://github.com/roboflow/sports) - An open-source repository providing computer vision tools and models for sports analytics, particularly focused on soccer/football detection tasks.
+
+## Các hướng tối ưu đã thử và đề xuất
+
+### Đã thực hiện:
+- Detect/tracking trên frame resize nhỏ (640x360, 960x540) để tăng tốc, sau đó scale bbox về kích thước gốc.
+- CLIP-based filtering trên frame resize (640x360, 960x540, 1280x720): tốc độ tăng nhưng chất lượng giảm mạnh với object nhỏ.
+- CLIP-based filtering trên frame gốc (full size): chất lượng tốt nhất, BBox Score cao, tốc độ chậm hơn.
+- Batch CLIP toàn bộ object của video hoặc từng frame: giảm số lần gọi CLIP, tận dụng GPU tốt hơn.
+- Multi-thread/multi-process filter: tăng tốc filter/scoring nếu CPU-bound.
+- Scale bbox về gốc ngay sau detect, các bước sau luôn làm việc với bbox gốc.
+- Fake object và keypoint sinh sau cùng, dựa trên bbox/frame gốc.
+
+### Vấn đề còn tồn tại:
+- CLIP inference vẫn là bottleneck lớn nhất.
+- Tốc độ CLIP không tăng nhiều nếu object/frame nhiều, hoặc GPU không đủ mạnh.
+- Nếu object nhỏ, CLIP vẫn có thể nhầm lẫn, đặc biệt khi crop ROI quá nhỏ.
+- Fake object có thể không hợp lệ nếu không filter lại bằng CLIP.
+
+### Hướng tối ưu mới đề xuất:
+- Dùng phiên bản CLIP nhỏ hơn (ViT-B/16, ViT-S/16) hoặc quantized để tăng tốc inference.
+- Gom batch CLIP cho nhiều frame cùng lúc (nếu RAM/GPU đủ).
+- Tăng scale khi crop ROI cho CLIP (lấy vùng lớn hơn bbox).
+- Sử dụng ONNX/TensorRT cho CLIP để inference nhanh hơn.
+- Caching kết quả CLIP theo tracking ID.
+- Chỉ filter CLIP cho object nghi ngờ (detector score thấp).
+- Vectorize toàn bộ pipeline filter/scoring bằng numpy/pandas.
+- Tối ưu fake object: chỉ sinh khi cần, luôn filter lại bằng CLIP.
+
+## Logic pipeline hiện tại
+
+- Detect/tracking thực hiện trên frame resize nhỏ (ví dụ 640x360), scale bbox về kích thước gốc ngay sau detect.
+- CLIP-based filtering thực hiện trên frame gốc và bbox gốc, đảm bảo chất lượng phân loại tốt nhất.
+- CLIP inference sử dụng ONNXRuntime (hoặc TensorRT nếu có) để tăng tốc mạnh mẽ, đặc biệt trên GPU mạnh như A100.
+- Các bước fake object, keypoint, aggregation đều làm việc với bbox/frame gốc.
+
+## Đánh giá cách tối ưu mới (ONNX/TensorRT)
+
+- CLIP inference tăng tốc mạnh trên GPU mạnh (A100), thời gian filter giảm từ 26s xuống 1-3s cho 750 frames.
+- Tổng pipeline có thể giảm từ 40s xuống 13-17s nếu detect/tracking cũng tối ưu.
+- Chất lượng CLIP giữ nguyên, không giảm so với HuggingFace.
+- Nên batch CLIP lớn nhất có thể để tận dụng tối đa GPU.

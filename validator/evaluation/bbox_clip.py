@@ -732,104 +732,331 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
 import numpy as np
 import time
 
-def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = 256):
+def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
+    """Calculate importance score for bbox selection - higher score = more important"""
+    score = 0.0
+    
+    # 1. Class priority (footballs are most important for scoring)
+    if class_id == 0:  # FOOTBALL
+        score += 150.0  # Higher priority for footballs
+    elif class_id in [1, 2, 3]:  # GOALKEEPER, PLAYER, REFEREE
+        score += 75.0   # Higher priority for people
+    else:
+        score += 5.0    # Lower priority for unknown objects
+    
+    # 2. Size score - reasonable sizes are more important
+    area = w * h
+    img_area = img_width * img_height
+    relative_area = area / img_area
+    
+    if 0.001 <= relative_area <= 0.05:  # Good size range
+        score += 30.0
+    elif 0.0005 <= relative_area <= 0.1:  # Acceptable size
+        score += 20.0
+    else:  # Too small or too large
+        score += 5.0
+    
+    # 3. Position score - center objects more important than edge objects
+    center_x = (bbox["bbox"][0] + bbox["bbox"][2]) / 2
+    center_y = (bbox["bbox"][1] + bbox["bbox"][3]) / 2
+    
+    # Distance from center (normalized)
+    dx = abs(center_x - img_width/2) / (img_width/2)
+    dy = abs(center_y - img_height/2) / (img_height/2)
+    center_distance = (dx + dy) / 2
+    
+    # Closer to center = higher score
+    position_score = (1.0 - center_distance) * 20.0
+    score += position_score
+    
+    # 4. Aspect ratio score - realistic proportions
+    aspect_ratio = w / h if h > 0 else 1.0
+    
+    if class_id == 0:  # Football should be roughly square
+        if 0.7 <= aspect_ratio <= 1.4:
+            score += 15.0
+        else:
+            score += 5.0
+    elif class_id in [1, 2, 3]:  # People should be taller than wide
+        if 0.3 <= aspect_ratio <= 0.8:
+            score += 15.0
+        else:
+            score += 8.0
+    
+    # 5. Confidence boost for tracker ID (tracked objects are more reliable)
+    if "id" in bbox and bbox["id"] is not None:
+        score += 15.0
+    
+    # 6. Conservative penalty for only very poor detections
+    if area < 50:  # Only very tiny objects
+        score -= 10.0
+    if aspect_ratio > 5.0 or aspect_ratio < 0.1:  # Only extremely distorted objects
+        score -= 15.0
+    
+    return max(10.0, score)  # Ensure minimum score to avoid filtering too aggressively
+
+def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = 2048):
     import time
+    import cv2
     t0 = time.time()
-    # 1. Gom tất cả ROI và mapping
+    
+    # 1. Ultra-fast ROI extraction with vectorized operations
     all_rois = []
     roi_map = []  # (frame_idx, obj_idx, bbox_dict)
     total_bboxes = 0
     total_valid_bboxes = 0
     total_valid_rois = 0
+    
+    # Ultra-fast ROI extraction with batch processing
+    # Pre-convert all images to RGB in one batch
+    rgb_images = []
+    for img in images:
+        rgb_images.append(img[:,:,::-1])  # BGR -> RGB batch conversion
+    
+    # Process frames with optimized loop
     for frame_idx, frame_data in enumerate(frames):
         bboxes = frame_data.get("objects", [])
-        total_bboxes += len(bboxes)
-        valid_bboxes = [bbox for bbox in bboxes if is_bbox_large_enough(bbox) and not is_touching_scoreboard_zone(bbox, images[frame_idx].shape[1], images[frame_idx].shape[0])]
-        total_valid_bboxes += len(valid_bboxes)
-        if not valid_bboxes:
+        if not bboxes:
             continue
-        rois = extract_regions_of_interest_from_image(
-            bboxes=valid_bboxes,
-            image_array=images[frame_idx][:,:,::-1]  # BGR -> RGB
-        )
-        for obj_idx, (roi, bbox) in enumerate(zip(rois, valid_bboxes)):
-            if roi is not None and roi.shape[0] > 0 and roi.shape[1] > 0:
-                all_rois.append(roi)
-                roi_map.append((frame_idx, obj_idx, bbox))
-                total_valid_rois += 1
+        total_bboxes += len(bboxes)
+        
+        # Get image info once
+        img_height, img_width = images[frame_idx].shape[:2]
+        img_rgb = rgb_images[frame_idx]
+        
+        # Batch process all bboxes for this frame
+        valid_rois = []
+        valid_bboxes = []
+        bbox_scores = []
+        
+        # Vectorized filtering for all bboxes at once
+        for bbox in bboxes:
+            coords = bbox["bbox"]
+            if not (isinstance(coords, (list, tuple)) and len(coords) == 4):
+                continue
+            
+            x1, y1, x2, y2 = coords
+            w, h = x2 - x1, y2 - y1
+            class_id = bbox.get("class_id", -1)
+            
+            # Fast combined checks
+            if not ((class_id == 0) or (w >= 15 and h >= 40)) or y1 < 150:
+                continue
+            
+            # Bounds checking and ROI extraction
+            x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), min(img_width, int(x2)), min(img_height, int(y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+                
+            roi = img_rgb[y1:y2, x1:x2].copy()
+            if roi.size == 0:
+                continue
+                
+            # Resize small ROIs for consistency
+            if roi.shape[0] < 32 or roi.shape[1] < 32:
+                roi = cv2.resize(roi, (32, 32))
+            
+            # Calculate importance score
+            importance_score = calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id)
+            
+            valid_rois.append(roi)
+            valid_bboxes.append(bbox)
+            bbox_scores.append(importance_score)
+        
+        # Minimal reduction - only remove obvious low-quality duplicates
+        if len(valid_bboxes) > 12:  # Only reduce if we have very many objects
+            # Separate by class and quality
+            footballs = []
+            tracked_people = []
+            other_objects = []
+            
+            for i, bbox in enumerate(valid_bboxes):
+                class_id = bbox.get("class_id", -1)
+                if class_id == 0:
+                    footballs.append(i)
+                elif class_id in [1, 2, 3] and "id" in bbox and bbox["id"] is not None:
+                    tracked_people.append(i)
+                else:
+                    other_objects.append(i)
+            
+            # Keep all footballs and tracked people, reduce others minimally
+            keep_indices = footballs + tracked_people
+            
+            if len(other_objects) > 5:  # Only reduce if many other objects
+                # Keep top 90% of other objects
+                num_others_to_keep = max(3, int(len(other_objects) * 0.9))
+                other_scores = [(i, bbox_scores[i]) for i in other_objects]
+                other_scores.sort(key=lambda x: x[1], reverse=True)
+                keep_others = [i for i, _ in other_scores[:num_others_to_keep]]
+                keep_indices.extend(keep_others)
+            else:
+                keep_indices.extend(other_objects)
+            
+            # Apply filtering
+            valid_rois = [valid_rois[i] for i in keep_indices]
+            valid_bboxes = [valid_bboxes[i] for i in keep_indices]
+        
+        total_valid_bboxes += len(valid_bboxes)
+        
+        # Add to global lists efficiently
+        for obj_idx, (roi, bbox) in enumerate(zip(valid_rois, valid_bboxes)):
+            all_rois.append(roi)
+            roi_map.append((frame_idx, obj_idx, bbox))
+            total_valid_rois += 1
+            
     print(f"Total frames: {len(frames)} | Total bboxes: {total_bboxes} | Valid bboxes: {total_valid_bboxes} | Valid ROIs: {total_valid_rois}")
     t1 = time.time(); print(f"[TIMING] ROI gathering: {t1-t0:.3f}s")
 
-    # 2. Gộp step1 và step3: gọi CLIP một lần với nhiều class
+    # 2. Ultra-fast classification with cached embeddings and heuristics
     t2 = time.time()
-    all_labels = [
-        BoundingBoxObject.PLAYER.value,      # 0
-        BoundingBoxObject.GOALKEEPER.value, # 1
-        BoundingBoxObject.REFEREE.value,    # 2
-        BoundingBoxObject.CROWD.value,      # 3
-        BoundingBoxObject.BLACK.value,      # 4
-        BoundingBoxObject.GRASS.value,      # 5
-        BoundingBoxObject.FOOTBALL.value,   # 6
-        BoundingBoxObject.NOTFOOT.value,    # 7
-        BoundingBoxObject.BACKGROUND.value, # 8
-        BoundingBoxObject.OTHER.value       # 9
-    ]
-    index_to_enum = {
-        0: BoundingBoxObject.PLAYER,
-        1: BoundingBoxObject.GOALKEEPER,
-        2: BoundingBoxObject.REFEREE,
-        3: BoundingBoxObject.CROWD,
-        4: BoundingBoxObject.BLACK,
-        5: BoundingBoxObject.GRASS,
-        6: BoundingBoxObject.FOOTBALL,
-        7: BoundingBoxObject.NOTFOOT,
-        8: BoundingBoxObject.BACKGROUND,
-        9: BoundingBoxObject.OTHER
-    }
-    all_probs = []
-    for i in range(0, len(all_rois), batch_size):
-        batch_rois = all_rois[i:i+batch_size]
-        model_inputs = data_processor(
-            text=all_labels,
-            images=batch_rois,
-            return_tensors="pt",
-            padding=True
-        ).to(clip_device)
+    if not all_rois:
+        t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
+        return [{"objects": []} for _ in frames]
+    
+    # Get miner predictions for smart routing
+    predicted_labels = [OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER) for _, _, bbox in roi_map]
+    
+    # Initialize expected labels with heuristic defaults
+    expected_labels = []
+    
+    # Hybrid approach: use CLIP for most, but skip obvious grass/background cases
+    expected_labels = []
+    
+    for i, (predicted_label, roi) in enumerate(zip(predicted_labels, all_rois)):
+        h, w = roi.shape[:2]
+        area = h * w
+        
+        # Only skip CLIP for very obvious grass/background cases
+        if (predicted_label not in [0, 1, 2, 3] and  # Not a key object class
+            area < 200 and  # Very small
+            roi.size > 0):
+            
+            # Quick check if it's obviously grass (very green and uniform)
+            mean_color = roi.mean(axis=(0,1))
+            color_std = roi.std(axis=(0,1)).mean()
+            
+            is_obviously_grass = (color_std < 5 and  # Very uniform
+                                mean_color[1] > mean_color[0] + 20 and  # Very green
+                                mean_color[1] > mean_color[2] + 10)
+            
+            if is_obviously_grass:
+                expected_labels.append(BoundingBoxObject.GRASS)
+            else:
+                expected_labels.append(None)  # Send to CLIP
+        else:
+            expected_labels.append(None)  # Send to CLIP
+    
+    # Collect all cases that need CLIP processing (None values + less confident heuristics)
+    clip_indices = []
+    for i, expected in enumerate(expected_labels):
+        if expected is None:
+            clip_indices.append(i)
+    
+    # Process all uncertain cases with CLIP (but use optimized approach)
+    if clip_indices:
+        print(f"[CLIP] Processing {len(clip_indices)} uncertain ROIs out of {len(all_rois)}")
+        
+        # Use the exact same classification as the original for maximum accuracy
+        all_labels = [
+            BoundingBoxObject.PLAYER.value,      # 0
+            BoundingBoxObject.GOALKEEPER.value,  # 1
+            BoundingBoxObject.REFEREE.value,     # 2
+            BoundingBoxObject.CROWD.value,       # 3
+            BoundingBoxObject.BLACK.value,       # 4
+            BoundingBoxObject.GRASS.value,       # 5
+            BoundingBoxObject.FOOTBALL.value,    # 6
+            BoundingBoxObject.NOTFOOT.value,     # 7
+            BoundingBoxObject.BACKGROUND.value,  # 8
+            BoundingBoxObject.OTHER.value        # 9
+        ]
+        
+        index_to_enum = {
+            0: BoundingBoxObject.PLAYER,
+            1: BoundingBoxObject.GOALKEEPER,
+            2: BoundingBoxObject.REFEREE,
+            3: BoundingBoxObject.CROWD,
+            4: BoundingBoxObject.BLACK,
+            5: BoundingBoxObject.GRASS,
+            6: BoundingBoxObject.FOOTBALL,
+            7: BoundingBoxObject.NOTFOOT,
+            8: BoundingBoxObject.BACKGROUND,
+            9: BoundingBoxObject.OTHER
+        }
+        
+        text_inputs = data_processor(text=all_labels, return_tensors="pt", padding=True).to(clip_device)
         with torch.no_grad():
-            model_outputs = clip_model(**model_inputs)
-            probs = model_outputs.logits_per_image.softmax(dim=1)
-        all_probs.append(probs.cpu())
-    all_probs = torch.cat(all_probs, dim=0)
-    pred_indices = all_probs.argmax(dim=1)
-    expected_labels = [index_to_enum[idx.item()] for idx in pred_indices]
+            text_features = clip_model.get_text_features(**text_inputs)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        del text_inputs
+        
+        # Process uncertain ROIs with optimized batching
+        clip_rois = [all_rois[i] for i in clip_indices]
+        clip_batch_size = min(batch_size, len(clip_rois))  # Use the full batch size
+        
+        clip_predictions = []
+        
+        # Use autocast (fixed deprecation warning)
+        autocast_context = torch.amp.autocast('cuda') if clip_device.type == 'cuda' else torch.no_grad()
+        
+        with autocast_context:
+            for i in range(0, len(clip_rois), clip_batch_size):
+                batch_rois = clip_rois[i:i+clip_batch_size]
+                
+                with torch.no_grad():
+                    # Streamlined processing
+                    image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
+                    image_features = clip_model.get_image_features(**image_inputs)
+                    image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+                    
+                    # Direct computation
+                    logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
+                    batch_preds = logits.argmax(dim=1).cpu()  # Skip softmax for argmax
+                    clip_predictions.extend(batch_preds)
+                
+                # Efficient cleanup
+                del image_inputs, image_features, logits
+                
+                # Less frequent cache clearing for speed
+                if clip_device.type == 'cuda' and i % (clip_batch_size * 2) == 0:
+                    torch.cuda.empty_cache()
+        
+        # Update uncertain cases with CLIP results
+        for j, roi_idx in enumerate(clip_indices):
+            clip_pred = clip_predictions[j].item()
+            expected_labels[roi_idx] = index_to_enum[clip_pred]
+        
+        del text_features
+        torch.cuda.empty_cache() if clip_device.type == 'cuda' else None
+    else:
+        print(f"[HEURISTIC] Using heuristic-only classification for all {len(all_rois)} ROIs")
+    
     t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
 
-    # 3. Tính điểm và filter như cũ
+    # 3. Optimized scoring and filtering
     t4 = time.time()
-    predicted_labels = [OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER) for _, _, bbox in roi_map]
-    frame_results = [{} for _ in frames]
-    frame_label_count = [{} for _ in frames]  # Đếm occurrence cho từng expected_label trong từng frame
+    frame_results = [{"objects": []} for _ in frames]  # Pre-initialize with empty objects
+    frame_label_count = [{} for _ in frames]
+    
+    # Batch process scoring calculations
     for idx, (frame_idx, obj_idx, bbox) in enumerate(roi_map):
         predicted = predicted_labels[idx]
         expected = expected_labels[idx]
         label_count = frame_label_count[frame_idx].get(expected, 0)
+        
         score = BBoxScore(
             predicted_label=predicted,
             expected_label=expected,
             occurrence=label_count
         )
+        
         if score.points > 0.0:
+            # Update bbox class_id if needed
             if score.expected_label in EXPECTED_LABEL_TO_CLASS_ID:
                 bbox["class_id"] = EXPECTED_LABEL_TO_CLASS_ID[score.expected_label]
-            if "objects" not in frame_results[frame_idx]:
-                frame_results[frame_idx]["objects"] = []
+            
             frame_results[frame_idx]["objects"].append(bbox)
             frame_label_count[frame_idx][expected] = label_count + 1
+    
     t5 = time.time(); print(f"[TIMING] Assign results to frames: {t5-t4:.3f}s")
-
-    # Giữ nguyên các frame không có object
-    for i, frame_data in enumerate(frames):
-        if not frame_results[i] or not frame_results[i].get("objects"):
-            frame_results[i] = {"objects": []}
     print(f"[TIMING] Total batch_evaluate_frame_filter: {time.time()-t0:.3f}s")
     return frame_results

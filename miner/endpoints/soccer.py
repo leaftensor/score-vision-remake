@@ -225,7 +225,7 @@ async def process_soccer_video(
                     images.append(fd["frame"])
                 else:
                     raise ValueError(f"Frame {fd['frame_number']} missing 'frame' key for batch CLIP filtering.")
-            filtered_frames = batch_evaluate_frame_filter(frames, images, batch_size=512)
+            filtered_frames = batch_evaluate_frame_filter(frames, images)
             for i, frame_data in enumerate(filtered_frames):
                 tracking_data["frames"][i]["objects"] = frame_data["objects"]
         else:

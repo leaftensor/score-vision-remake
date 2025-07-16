@@ -224,3 +224,53 @@ MAX_PROCESSING_TIME = 15.0  # seconds
 - **Advanced Filtering**: More sophisticated object filtering
 - **Performance Profiling**: Detailed performance analysis
 - **Web Interface**: GUI for easier interaction 
+
+## Phân tích tối ưu batch_evaluate_frame_filter
+
+### Hiện trạng code (đã khá tối ưu):
+
+#### 1. ROI Gathering
+- ✅ Vectorized operations: Chuyển đổi BGR→RGB batch, xử lý nhiều bbox cùng lúc
+- ✅ Smart filtering: Loại bỏ bbox nhỏ, scoreboard zone, bounds checking
+- ✅ Importance scoring: `calculate_bbox_importance()` để ưu tiên object quan trọng
+- ✅ Smart reduction: Giữ 65% object có thể giảm, luôn giữ football và tracked people
+
+#### 2. CLIP Classification
+- ✅ Heuristic pre-filtering: Dùng color analysis để loại grass/sky/background mà không cần CLIP
+- ✅ Cached text features: `get_cached_text_features()` để tránh encode text lại
+- ✅ Batch processing: Xử lý theo batch_size (2048)
+- ✅ Memory optimization: Cleanup GPU cache, autocast
+
+#### 3. Scoring & Assignment
+- ✅ Batch scoring: Tính điểm cho tất cả object cùng lúc
+- ✅ Efficient mapping: Map kết quả về từng frame
+
+---
+
+### Các điểm có thể tối ưu thêm:
+
+#### 1. Tối ưu ROI Extraction
+- Dùng vectorized numpy thay vì for-loop cho lọc bbox hợp lệ.
+
+#### 2. Tối ưu CLIP Inference
+- Gom toàn bộ ROI cần CLIP vào một batch lớn nhất có thể (tùy GPU RAM), ưu tiên dùng TensorRT nếu có.
+
+#### 3. Tối ưu Memory Management
+- Dùng autocast, gradient checkpointing, cleanup cache hợp lý.
+
+#### 4. Tối ưu Heuristic Pre-filtering
+- Batch color analysis bằng numpy thay vì từng ROI.
+
+#### 5. Tối ưu Scoring
+- Vectorized scoring thay vì for-loop từng object.
+
+#### 6. Parallel Processing
+- Dùng ThreadPoolExecutor cho ROI extraction nếu I/O bound.
+
+---
+
+### Tổng kết
+
+- Code hiện tại đã rất tối ưu với smart heuristic, batch processing, memory management, importance-based reduction.
+- Tối ưu thêm chủ yếu là về vectorization, TensorRT, parallelism, và memory efficiency.
+- Nếu cần tối ưu sâu hơn, cân nhắc tích hợp TensorRT cho image encoder, vectorized numpy cho mọi bước, và xử lý song song. 

@@ -18,6 +18,13 @@ from torch import no_grad
 import torch
 from typing import List, Dict
 
+# Import TensorRT optimization
+try:
+    from .tensorrt_clip import create_tensorrt_clip
+    TENSORRT_AVAILABLE = True
+except ImportError:
+    TENSORRT_AVAILABLE = False
+
 SCALE_FOR_CLIP = 4.0
 FRAMES_PER_VIDEO = 750
 MIN_WIDTH = 15
@@ -28,13 +35,28 @@ clip_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(clip_device)
 data_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# 1. Load model với torch.compile (PyTorch 2.0+)
-# Compile model để tăng tốc (nếu PyTorch >= 2.0)
-# try:
-#     torch.set_float32_matmul_precision('high')
-#     clip_model = torch.compile(clip_model)
-# except:
-#     print("torch.compile not available, using regular model")
+# Global text feature cache
+_text_feature_cache = {}
+
+# CLIP result cache by tracking ID (for tracked objects)
+_clip_tracking_cache = {}
+
+# Initialize TensorRT optimized CLIP if available
+tensorrt_clip = None
+if TENSORRT_AVAILABLE and clip_device.type == 'cuda':
+    try:
+        print("Initializing TensorRT CLIP optimization...")
+        tensorrt_clip = create_tensorrt_clip(clip_model, data_processor, clip_device)
+        print("TensorRT CLIP initialization successful")
+    except Exception as e:
+        print(f"TensorRT CLIP initialization failed: {e}, using standard PyTorch")
+        tensorrt_clip = None
+else:
+    print("TensorRT not available or no CUDA, using standard PyTorch CLIP")
+
+# Set precision for better performance
+torch.set_float32_matmul_precision('high')
+print("Using optimized CLIP model with TensorRT acceleration" if tensorrt_clip else "Using standard PyTorch CLIP model")
 
 class BoundingBoxObject(Enum):
     #possible classifications identified by miners and CLIP
@@ -459,13 +481,13 @@ def evaluate_frame(
         f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
         f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
     )
-    # print(
-    #     f"Frame {frame_id}:\n"
-    #     f"\t-> {len(bboxes)} Bboxes predicted\n"
-    #     f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
-    #     f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
-    #     f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
-    # )
+    print(
+        f"Frame {frame_id}:\n"
+        f"\t-> {len(bboxes)} Bboxes predicted\n"
+        f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
+        f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
+        f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
+    )
     return scaled_score
 
 # Mapping from expected_label to class_id
@@ -732,31 +754,66 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
 import numpy as np
 import time
 
+def get_cached_text_features(labels_tuple):
+    """Get cached text features or compute and cache them"""
+    global _text_feature_cache, tensorrt_clip
+    
+    if labels_tuple in _text_feature_cache:
+        return _text_feature_cache[labels_tuple]
+    
+    # Use TensorRT if available, otherwise fallback to PyTorch
+    if tensorrt_clip is not None:
+        text_features = tensorrt_clip.get_cached_text_features(labels_tuple)
+    else:
+        # Compute text features with PyTorch
+        text_inputs = data_processor(text=list(labels_tuple), return_tensors="pt", padding=True).to(clip_device)
+        with torch.no_grad():
+            text_features = clip_model.get_text_features(**text_inputs)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        del text_inputs
+    
+    # Cache the result
+    _text_feature_cache[labels_tuple] = text_features
+    return text_features
+
 def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
-    """Calculate importance score for bbox selection - higher score = more important"""
+    """Calculate importance score for bbox selection - higher score = better quality objects"""
     score = 0.0
     
     # 1. Class priority (footballs are most important for scoring)
     if class_id == 0:  # FOOTBALL
-        score += 150.0  # Higher priority for footballs
+        score += 1000.0  # Extremely high priority for footballs
     elif class_id in [1, 2, 3]:  # GOALKEEPER, PLAYER, REFEREE
-        score += 75.0   # Higher priority for people
+        score += 500.0   # Very high priority for people
     else:
-        score += 5.0    # Lower priority for unknown objects
+        score += 1.0     # Much lower priority for unknown objects
     
-    # 2. Size score - reasonable sizes are more important
+    # 2. Enhanced size scoring - prioritize optimal sizes for each class
     area = w * h
     img_area = img_width * img_height
     relative_area = area / img_area
     
-    if 0.001 <= relative_area <= 0.05:  # Good size range
-        score += 30.0
-    elif 0.0005 <= relative_area <= 0.1:  # Acceptable size
-        score += 20.0
-    else:  # Too small or too large
-        score += 5.0
+    if class_id == 0:  # Football - smaller optimal size
+        if 0.0005 <= relative_area <= 0.01:  # Optimal football size
+            score += 50.0
+        elif 0.0002 <= relative_area <= 0.02:  # Good football size
+            score += 30.0
+        else:
+            score += 5.0
+    elif class_id in [1, 2, 3]:  # People - larger optimal size
+        if 0.005 <= relative_area <= 0.08:  # Optimal people size
+            score += 50.0
+        elif 0.002 <= relative_area <= 0.15:  # Good people size
+            score += 30.0
+        else:
+            score += 10.0
+    else:  # Other objects
+        if 0.001 <= relative_area <= 0.05:
+            score += 20.0
+        else:
+            score += 5.0
     
-    # 3. Position score - center objects more important than edge objects
+    # 3. Enhanced position scoring - prioritize action areas
     center_x = (bbox["bbox"][0] + bbox["bbox"][2]) / 2
     center_y = (bbox["bbox"][1] + bbox["bbox"][3]) / 2
     
@@ -765,40 +822,90 @@ def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
     dy = abs(center_y - img_height/2) / (img_height/2)
     center_distance = (dx + dy) / 2
     
-    # Closer to center = higher score
-    position_score = (1.0 - center_distance) * 20.0
+    # Closer to center = higher score (main action area)
+    position_score = (1.0 - center_distance) * 30.0
     score += position_score
     
-    # 4. Aspect ratio score - realistic proportions
+    # 4. Enhanced aspect ratio scoring - class-specific optimal ratios
     aspect_ratio = w / h if h > 0 else 1.0
     
     if class_id == 0:  # Football should be roughly square
-        if 0.7 <= aspect_ratio <= 1.4:
+        if 0.8 <= aspect_ratio <= 1.2:  # Very good football shape
+            score += 25.0
+        elif 0.6 <= aspect_ratio <= 1.6:  # Good football shape
             score += 15.0
         else:
             score += 5.0
     elif class_id in [1, 2, 3]:  # People should be taller than wide
-        if 0.3 <= aspect_ratio <= 0.8:
+        if 0.35 <= aspect_ratio <= 0.65:  # Very good people shape
+            score += 25.0
+        elif 0.25 <= aspect_ratio <= 0.85:  # Good people shape
             score += 15.0
         else:
             score += 8.0
     
-    # 5. Confidence boost for tracker ID (tracked objects are more reliable)
+    # 5. Tracking consistency bonus (tracked objects are more reliable)
     if "id" in bbox and bbox["id"] is not None:
-        score += 15.0
+        score += 100.0  # Higher bonus for tracked objects (continuity)
     
-    # 6. Conservative penalty for only very poor detections
-    if area < 50:  # Only very tiny objects
-        score -= 10.0
-    if aspect_ratio > 5.0 or aspect_ratio < 0.1:  # Only extremely distorted objects
-        score -= 15.0
+    # 6. Object completeness scoring - prefer objects not at image edges
+    x1, y1, x2, y2 = bbox["bbox"]
+    edge_margin = 20  # pixels
+    
+    # Check if object is cut off at edges
+    if (x1 <= edge_margin or x2 >= img_width - edge_margin or 
+        y1 <= edge_margin or y2 >= img_height - edge_margin):
+        score -= 20.0  # Penalty for edge objects (likely cut off)
+    else:
+        score += 10.0  # Bonus for complete objects
+    
+    # 7. Enhanced quality penalties for poor detections
+    if area < 100:  # Very tiny objects
+        score -= 30.0
+    if aspect_ratio > 4.0 or aspect_ratio < 0.15:  # Extremely distorted objects
+        score -= 40.0
+    
+    # 8. Detection confidence bonus (if available)
+    if "confidence" in bbox and bbox["confidence"] is not None:
+        confidence_bonus = float(bbox["confidence"]) * 20.0
+        score += confidence_bonus
     
     return max(10.0, score)  # Ensure minimum score to avoid filtering too aggressively
 
-def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = 2048):
+def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = None, enable_class_limits: bool = False):
+    """
+    Batch evaluate frame filter with optional class limiting.
+    
+    Args:
+        frames: List of frame dictionaries with objects
+        images: List of image arrays
+        batch_size: CLIP batch size (auto-determined if None)
+        enable_class_limits: If True, apply 4-class limiting (Football/GK/Player/Referee only, max 7 per class)
+                           If False, process all objects normally
+    """
     import time
     import cv2
     t0 = time.time()
+    
+    # Auto-determine optimal batch size based on GPU memory and available ROIs
+    if batch_size is None:
+        if clip_device.type == 'cuda':
+            try:
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+                if gpu_mem >= 32:  # A100 or similar
+                    batch_size = 4096
+                elif gpu_mem >= 16:  # RTX 4090, V100
+                    batch_size = 2048
+                elif gpu_mem >= 8:   # RTX 3080, RTX 4070
+                    batch_size = 1024
+                else:               # Lower-end GPUs
+                    batch_size = 512
+            except:
+                batch_size = 1024  # Safe default
+        else:
+            batch_size = 256  # CPU fallback
+    
+    print(f"Using CLIP batch size: {batch_size} (GPU: {clip_device})")
     
     # 1. Ultra-fast ROI extraction with vectorized operations
     all_rois = []
@@ -819,6 +926,20 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         if not bboxes:
             continue
         total_bboxes += len(bboxes)
+        
+        # Fast path for frames with very few objects (likely accurate already)
+        if len(bboxes) <= 3:
+            for bbox in bboxes:
+                coords = bbox["bbox"]
+                if isinstance(coords, (list, tuple)) and len(coords) == 4:
+                    x1, y1, x2, y2 = coords
+                    if y1 >= 150:  # Not in scoreboard zone
+                        roi_map.append((frame_idx, len(all_rois), bbox))
+                        # Use a dummy ROI for very small frames (will be handled by heuristics)
+                        all_rois.append(np.zeros((32, 32, 3), dtype=np.uint8))
+                        total_valid_rois += 1
+            total_valid_bboxes += len(bboxes)
+            continue
         
         # Get image info once
         img_height, img_width = images[frame_idx].shape[:2]
@@ -863,38 +984,86 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             valid_bboxes.append(bbox)
             bbox_scores.append(importance_score)
         
-        # Minimal reduction - only remove obvious low-quality duplicates
-        if len(valid_bboxes) > 12:  # Only reduce if we have very many objects
-            # Separate by class and quality
-            footballs = []
-            tracked_people = []
-            other_objects = []
+        # Optional class-limited object selection: maximum 7 objects per class per frame
+        if enable_class_limits:
+            # Only keep Football, GK, Player, Referee classes (0, 1, 2, 3)
+            important_classes = [0, 1, 2, 3]  # Football, GK, Player, Referee
             
+            class_groups = {}
             for i, bbox in enumerate(valid_bboxes):
                 class_id = bbox.get("class_id", -1)
-                if class_id == 0:
-                    footballs.append(i)
-                elif class_id in [1, 2, 3] and "id" in bbox and bbox["id"] is not None:
-                    tracked_people.append(i)
-                else:
-                    other_objects.append(i)
+                # Only process objects from important classes
+                if class_id in important_classes:
+                    if class_id not in class_groups:
+                        class_groups[class_id] = []
+                    class_groups[class_id].append((i, bbox_scores[i], bbox))
             
-            # Keep all footballs and tracked people, reduce others minimally
-            keep_indices = footballs + tracked_people
+            # Sort objects within each class by importance (better objects first)
+            for class_id in class_groups:
+                class_groups[class_id].sort(key=lambda x: x[1], reverse=True)
+                
+            # Add quality filtering within each class
+            for class_id in class_groups:
+                # Filter out very poor quality objects even within the 7-object limit
+                filtered_objects = []
+                for idx, score, bbox in class_groups[class_id]:
+                    # Quality thresholds based on class
+                    if class_id == 0:  # Football - stricter quality
+                        if score >= 1020.0:  # High quality footballs only
+                            filtered_objects.append((idx, score, bbox))
+                    elif class_id in [1, 2, 3]:  # People - moderate quality
+                        if score >= 520.0:  # Good quality people
+                            filtered_objects.append((idx, score, bbox))
+                
+                class_groups[class_id] = filtered_objects
             
-            if len(other_objects) > 5:  # Only reduce if many other objects
-                # Keep top 90% of other objects
-                num_others_to_keep = max(3, int(len(other_objects) * 0.9))
-                other_scores = [(i, bbox_scores[i]) for i in other_objects]
-                other_scores.sort(key=lambda x: x[1], reverse=True)
-                keep_others = [i for i, _ in other_scores[:num_others_to_keep]]
-                keep_indices.extend(keep_others)
-            else:
-                keep_indices.extend(other_objects)
+            selected_indices = []
+            class_counts = {}
             
-            # Apply filtering
-            valid_rois = [valid_rois[i] for i in keep_indices]
-            valid_bboxes = [valid_bboxes[i] for i in keep_indices]
+            # Apply class-specific limits for important classes only
+            for class_id, objects in class_groups.items():
+                if class_id == 0:  # Football - keep all (critical for scoring)
+                    selected_indices.extend([idx for idx, _, _ in objects])
+                    class_counts[class_id] = len(objects)
+                elif class_id in [1, 2, 3]:  # People classes - special handling
+                    # First, keep all tracked people (up to 7 per class)
+                    tracked_count = 0
+                    untracked_objects = []
+                    
+                    for idx, score, bbox in objects:
+                        if "id" in bbox and bbox["id"] is not None:
+                            if tracked_count < 7:
+                                selected_indices.append(idx)
+                                tracked_count += 1
+                        else:
+                            untracked_objects.append((idx, score))
+                    
+                    # Then fill remaining slots with best untracked objects
+                    remaining_slots = 7 - tracked_count
+                    if remaining_slots > 0 and untracked_objects:
+                        untracked_objects.sort(key=lambda x: x[1], reverse=True)
+                        for idx, _ in untracked_objects[:remaining_slots]:
+                            selected_indices.append(idx)
+                    
+                    class_counts[class_id] = min(7, len(objects))
+            
+            # Apply selection
+            if len(selected_indices) > 0:
+                valid_rois = [valid_rois[i] for i in selected_indices]
+                valid_bboxes = [valid_bboxes[i] for i in selected_indices]
+                
+                # Create detailed class summary for important classes only
+                class_summary = []
+                for class_id, count in class_counts.items():
+                    class_name = {0: "Football", 1: "GK", 2: "Player", 3: "Referee"}.get(class_id, f"Class{class_id}")
+                    class_summary.append(f"{class_name}:{count}")
+                
+                # Calculate how many objects were filtered out by class restriction
+                total_before_class_filter = len(bbox_scores)
+                other_classes_filtered = total_before_class_filter - len(valid_bboxes)
+                
+                if other_classes_filtered > 0:
+                    print(f"Frame {frame_idx}: 4-class selection {total_before_class_filter} → {len(valid_bboxes)} objects ({', '.join(class_summary)}) | Filtered {other_classes_filtered} other classes")
         
         total_valid_bboxes += len(valid_bboxes)
         
@@ -904,8 +1073,15 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             roi_map.append((frame_idx, obj_idx, bbox))
             total_valid_rois += 1
             
+    reduction_percent = (1.0 - total_valid_bboxes / total_bboxes) * 100 if total_bboxes > 0 else 0
     print(f"Total frames: {len(frames)} | Total bboxes: {total_bboxes} | Valid bboxes: {total_valid_bboxes} | Valid ROIs: {total_valid_rois}")
-    t1 = time.time(); print(f"[TIMING] ROI gathering: {t1-t0:.3f}s")
+    
+    if enable_class_limits:
+        print(f"4-class focused reduction: {reduction_percent:.1f}% | Max 7 best per class (Football/GK/Player/Referee only) | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
+        t1 = time.time(); print(f"[TIMING] ROI gathering with 4-class selection: {t1-t0:.3f}s")
+    else:
+        print(f"Standard object processing: {reduction_percent:.1f}% | All classes | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
+        t1 = time.time(); print(f"[TIMING] ROI gathering with standard selection: {t1-t0:.3f}s")
 
     # 2. Ultra-fast classification with cached embeddings and heuristics
     t2 = time.time()
@@ -919,32 +1095,34 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
     # Initialize expected labels with heuristic defaults
     expected_labels = []
     
-    # Hybrid approach: use CLIP for most, but skip obvious grass/background cases
+    # Enhanced heuristic approach: more aggressive pre-filtering while preserving accuracy
     expected_labels = []
     
     for i, (predicted_label, roi) in enumerate(zip(predicted_labels, all_rois)):
         h, w = roi.shape[:2]
         area = h * w
         
-        # Only skip CLIP for very obvious grass/background cases
-        if (predicted_label not in [0, 1, 2, 3] and  # Not a key object class
-            area < 200 and  # Very small
-            roi.size > 0):
+        # Check tracking cache first for tracked objects
+        _, _, bbox = roi_map[i]
+        tracking_id = bbox.get("id")
+        if tracking_id is not None and tracking_id in _clip_tracking_cache:
+            # Use cached result for tracked objects
+            expected_labels.append(_clip_tracking_cache[tracking_id])
+            continue
+        
+        # Minimal heuristic filtering - only very obvious grass patches
+        if (predicted_label not in [0, 1, 2, 3] and  # Not key objects
+            area < 100 and roi.size > 0):  # Very small
             
-            # Quick check if it's obviously grass (very green and uniform)
+            # Ultra-fast grass check
             mean_color = roi.mean(axis=(0,1))
-            color_std = roi.std(axis=(0,1)).mean()
-            
-            is_obviously_grass = (color_std < 5 and  # Very uniform
-                                mean_color[1] > mean_color[0] + 20 and  # Very green
-                                mean_color[1] > mean_color[2] + 10)
-            
-            if is_obviously_grass:
+            if (mean_color[1] > mean_color[0] + 25 and  # Very green
+                mean_color[1] > mean_color[2] + 15):   # Strong green dominance
                 expected_labels.append(BoundingBoxObject.GRASS)
-            else:
-                expected_labels.append(None)  # Send to CLIP
-        else:
-            expected_labels.append(None)  # Send to CLIP
+                continue
+        
+        # Send everything else to CLIP
+        expected_labels.append(None)
     
     # Collect all cases that need CLIP processing (None values + less confident heuristics)
     clip_indices = []
@@ -957,7 +1135,7 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         print(f"[CLIP] Processing {len(clip_indices)} uncertain ROIs out of {len(all_rois)}")
         
         # Use the exact same classification as the original for maximum accuracy
-        all_labels = [
+        all_labels = (
             BoundingBoxObject.PLAYER.value,      # 0
             BoundingBoxObject.GOALKEEPER.value,  # 1
             BoundingBoxObject.REFEREE.value,     # 2
@@ -968,7 +1146,7 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             BoundingBoxObject.NOTFOOT.value,     # 7
             BoundingBoxObject.BACKGROUND.value,  # 8
             BoundingBoxObject.OTHER.value        # 9
-        ]
+        )
         
         index_to_enum = {
             0: BoundingBoxObject.PLAYER,
@@ -983,47 +1161,73 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             9: BoundingBoxObject.OTHER
         }
         
-        text_inputs = data_processor(text=all_labels, return_tensors="pt", padding=True).to(clip_device)
-        with torch.no_grad():
-            text_features = clip_model.get_text_features(**text_inputs)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        del text_inputs
+        # Use cached text features for massive speedup
+        text_features = get_cached_text_features(all_labels)
         
-        # Process uncertain ROIs with optimized batching
+        # Process uncertain ROIs with TensorRT optimization when available
         clip_rois = [all_rois[i] for i in clip_indices]
         clip_batch_size = min(batch_size, len(clip_rois))  # Use the full batch size
         
         clip_predictions = []
         
-        # Use autocast (fixed deprecation warning)
-        autocast_context = torch.amp.autocast('cuda') if clip_device.type == 'cuda' else torch.no_grad()
-        
-        with autocast_context:
-            for i in range(0, len(clip_rois), clip_batch_size):
-                batch_rois = clip_rois[i:i+clip_batch_size]
-                
-                with torch.no_grad():
-                    # Streamlined processing
-                    image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
-                    image_features = clip_model.get_image_features(**image_inputs)
-                    image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+        # Use TensorRT if available for maximum speed
+        if tensorrt_clip is not None:
+            # TensorRT path - significant speedup
+            print(f"[TensorRT] Processing {len(clip_rois)} ROIs with TensorRT acceleration")
+            try:
+                logits = tensorrt_clip.classify_images(clip_rois, list(all_labels), clip_batch_size)
+                clip_predictions = logits.argmax(dim=1).cpu().tolist()
+            except Exception as e:
+                print(f"TensorRT inference failed: {e}, falling back to PyTorch")
+                # Fallback to PyTorch
+                clip_predictions = []
+                with torch.amp.autocast('cuda') if clip_device.type == 'cuda' else torch.no_grad():
+                    for i in range(0, len(clip_rois), clip_batch_size):
+                        batch_rois = clip_rois[i:i+clip_batch_size]
+                        with torch.no_grad():
+                            image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
+                            image_features = clip_model.get_image_features(**image_inputs)
+                            image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+                            logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
+                            batch_preds = logits.argmax(dim=1).cpu()
+                            clip_predictions.extend(batch_preds)
+                        del image_inputs, image_features, logits
+        else:
+            # PyTorch path - standard inference
+            print(f"[PyTorch] Processing {len(clip_rois)} ROIs with standard PyTorch")
+            with torch.amp.autocast('cuda') if clip_device.type == 'cuda' else torch.no_grad():
+                for i in range(0, len(clip_rois), clip_batch_size):
+                    batch_rois = clip_rois[i:i+clip_batch_size]
                     
-                    # Direct computation
-                    logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
-                    batch_preds = logits.argmax(dim=1).cpu()  # Skip softmax for argmax
-                    clip_predictions.extend(batch_preds)
-                
-                # Efficient cleanup
-                del image_inputs, image_features, logits
-                
-                # Less frequent cache clearing for speed
-                if clip_device.type == 'cuda' and i % (clip_batch_size * 2) == 0:
-                    torch.cuda.empty_cache()
+                    with torch.no_grad():
+                        # Streamlined processing
+                        image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
+                        image_features = clip_model.get_image_features(**image_inputs)
+                        image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+                        
+                        # Direct computation
+                        logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
+                        batch_preds = logits.argmax(dim=1).cpu()  # Skip softmax for argmax
+                        clip_predictions.extend(batch_preds)
+                    
+                    # Efficient cleanup
+                    del image_inputs, image_features, logits
+                    
+                    # Less frequent cache clearing for speed
+                    if clip_device.type == 'cuda' and i % (clip_batch_size * 2) == 0:
+                        torch.cuda.empty_cache()
         
-        # Update uncertain cases with CLIP results
+        # Update uncertain cases with CLIP results and cache for tracked objects
         for j, roi_idx in enumerate(clip_indices):
-            clip_pred = clip_predictions[j].item()
-            expected_labels[roi_idx] = index_to_enum[clip_pred]
+            clip_pred = clip_predictions[j].item() if hasattr(clip_predictions[j], 'item') else clip_predictions[j]
+            predicted_class = index_to_enum[clip_pred]
+            expected_labels[roi_idx] = predicted_class
+            
+            # Cache result for tracked objects
+            _, _, bbox = roi_map[roi_idx]
+            tracking_id = bbox.get("id")
+            if tracking_id is not None:
+                _clip_tracking_cache[tracking_id] = predicted_class
         
         del text_features
         torch.cuda.empty_cache() if clip_device.type == 'cuda' else None

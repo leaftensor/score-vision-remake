@@ -14,7 +14,7 @@ import math
 
 # Set the test video URL and input file path
 TEST_VIDEO_URL = "https://scoredata.me/2025_06_18/2025_06_18_d49f45ff/2025_06_18_d49f45ff_195945e20e9e4325b51ab84ff134c7_dcb7b85f.mp4"
-INPUT_SCORE_FILE = r"C:\Users\longp\Documents\GitHub\score-vision\miner\test_outputs\pipeline_test_results_1752204348.json"
+INPUT_SCORE_FILE = r"C:\Users\longp\Documents\GitHub\score-vision\miner\test_outputs\pipeline_results_1752776711.json"
 
 # Constants from validator config
 MAX_PROCESSING_TIME = 15.0

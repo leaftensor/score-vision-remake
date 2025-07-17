@@ -31,7 +31,7 @@ from validator.challenge.challenge_types import GSRResponse, GSRChallenge, Chall
 from validator.evaluation.evaluation import COLORS
 
 # Configuration
-TEST_VIDEO_URL = "https://scoredata.me/2025_06_18/2025_06_18_d49f45ff/2025_06_18_d49f45ff_195945e20e9e4325b51ab84ff134c7_dcb7b85f.mp4"
+TEST_VIDEO_URL = "https://scoredata.me/2025_06_11/2025_06_11_cbc6c066/2025_06_11_cbc6c066_h1_42e88f6a84384a64984769eb1059ec_78d4c0c5.mp4"
 MAX_PROCESSING_TIME = 15.0
 
 def optimize_coordinates(coords: List[float]) -> List[float]:

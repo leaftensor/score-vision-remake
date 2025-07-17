@@ -319,3 +319,6 @@ xnotes/custom-agents.md
 xnotes/project-idea-prompt.md
 .cursorignore
 .cursorindexingignore
+/onnx-clip
+/tensorrt_cache
+*.onnx

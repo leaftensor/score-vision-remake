@@ -252,7 +252,7 @@ class TensorRTCLIP:
         return text_features
     
     def _encode_text_tensorrt(self, texts: List[str]) -> torch.Tensor:
-        """Encode text using TensorRT"""
+        """Encode text using TensorRT with safe memory management"""
         try:
             # Tokenize texts
             text_inputs = self.data_processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=77)
@@ -261,32 +261,73 @@ class TensorRTCLIP:
             
             batch_size = input_ids.shape[0]
             
-            # Allocate GPU memory
-            input_ids_gpu = cuda.mem_alloc(input_ids.nbytes)
-            attention_mask_gpu = cuda.mem_alloc(attention_mask.nbytes)
-            output_gpu = cuda.mem_alloc(batch_size * 512 * 4)  # 512 features, float32
+            # Use safer memory allocation with proper cleanup
+            input_ids_gpu = None
+            attention_mask_gpu = None
+            output_gpu = None
             
-            # Copy inputs to GPU
-            cuda.memcpy_htod(input_ids_gpu, input_ids.cpu().numpy())
-            cuda.memcpy_htod(attention_mask_gpu, attention_mask.cpu().numpy())
-            
-            # Set input shapes
-            self.text_context.set_binding_shape(0, input_ids.shape)
-            self.text_context.set_binding_shape(1, attention_mask.shape)
-            
-            # Run inference
-            bindings = [int(input_ids_gpu), int(attention_mask_gpu), int(output_gpu)]
-            self.text_context.execute_v2(bindings)
-            
-            # Copy output back
-            output = np.empty((batch_size, 512), dtype=np.float32)
-            cuda.memcpy_dtoh(output, output_gpu)
-            
-            # Convert to tensor and normalize
-            text_features = torch.from_numpy(output).to(self.device)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            
-            return text_features
+            try:
+                # Allocate GPU memory
+                input_ids_gpu = cuda.mem_alloc(input_ids.nbytes)
+                attention_mask_gpu = cuda.mem_alloc(attention_mask.nbytes)
+                output_gpu = cuda.mem_alloc(batch_size * 512 * 4)  # 512 features, float32
+                
+                # Copy inputs to GPU
+                cuda.memcpy_htod(input_ids_gpu, input_ids.cpu().numpy())
+                cuda.memcpy_htod(attention_mask_gpu, attention_mask.cpu().numpy())
+                
+                # Set input shapes using new TensorRT API
+                if hasattr(self.text_context, 'set_input_shape'):
+                    # New TensorRT API
+                    self.text_context.set_input_shape('input_ids', input_ids.shape)
+                    self.text_context.set_input_shape('attention_mask', attention_mask.shape)
+                elif hasattr(self.text_context, 'set_binding_shape'):
+                    # Legacy TensorRT API
+                    self.text_context.set_binding_shape(0, input_ids.shape)
+                    self.text_context.set_binding_shape(1, attention_mask.shape)
+                else:
+                    # Fallback - try to get binding indices
+                    for i in range(self.text_engine.num_bindings):
+                        if self.text_engine.binding_is_input(i):
+                            if i == 0:
+                                self.text_context.set_binding_shape(i, input_ids.shape)
+                            elif i == 1:
+                                self.text_context.set_binding_shape(i, attention_mask.shape)
+                
+                # Run inference
+                bindings = [int(input_ids_gpu), int(attention_mask_gpu), int(output_gpu)]
+                success = self.text_context.execute_v2(bindings)
+                
+                if not success:
+                    raise RuntimeError("TensorRT text inference failed")
+                
+                # Copy output back
+                output = np.empty((batch_size, 512), dtype=np.float32)
+                cuda.memcpy_dtoh(output, output_gpu)
+                
+                # Convert to tensor and normalize
+                text_features = torch.from_numpy(output).to(self.device)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                
+                return text_features
+                
+            finally:
+                # Clean up GPU memory
+                if input_ids_gpu is not None:
+                    try:
+                        input_ids_gpu.free()
+                    except:
+                        pass
+                if attention_mask_gpu is not None:
+                    try:
+                        attention_mask_gpu.free()
+                    except:
+                        pass
+                if output_gpu is not None:
+                    try:
+                        output_gpu.free()
+                    except:
+                        pass
             
         except Exception as e:
             print(f"TensorRT text encoding failed: {e}, falling back to PyTorch")
@@ -315,12 +356,15 @@ class TensorRTCLIP:
         return torch.cat(all_features, dim=0)
     
     def _encode_images_tensorrt(self, images: List[np.ndarray], batch_size: int) -> torch.Tensor:
-        """Encode images using TensorRT"""
+        """Encode images using TensorRT with safe memory management"""
         try:
             all_features = []
             
-            for i in range(0, len(images), batch_size):
-                batch_images = images[i:i+batch_size]
+            # Use very small batch sizes to prevent memory issues
+            safe_batch_size = min(batch_size, 8)  # Much smaller batch size
+            
+            for i in range(0, len(images), safe_batch_size):
+                batch_images = images[i:i+safe_batch_size]
                 
                 # Preprocess images
                 image_inputs = self.data_processor(images=batch_images, return_tensors="pt")
@@ -328,31 +372,68 @@ class TensorRTCLIP:
                 
                 current_batch_size = pixel_values.shape[0]
                 
-                # Allocate GPU memory
-                input_gpu = cuda.mem_alloc(pixel_values.nbytes)
-                output_gpu = cuda.mem_alloc(current_batch_size * 512 * 4)  # 512 features, float32
+                # Use safer memory allocation with proper cleanup
+                input_gpu = None
+                output_gpu = None
                 
-                # Copy input to GPU
-                cuda.memcpy_htod(input_gpu, pixel_values.cpu().numpy())
-                
-                # Set input shape
-                self.image_context.set_binding_shape(0, pixel_values.shape)
-                
-                # Run inference
-                bindings = [int(input_gpu), int(output_gpu)]
-                self.image_context.execute_v2(bindings)
-                
-                # Copy output back
-                output = np.empty((current_batch_size, 512), dtype=np.float32)
-                cuda.memcpy_dtoh(output, output_gpu)
-                
-                # Convert to tensor and normalize
-                image_features = torch.from_numpy(output).to(self.device)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-                
-                all_features.append(image_features)
+                try:
+                    # Allocate GPU memory
+                    input_gpu = cuda.mem_alloc(pixel_values.nbytes)
+                    output_gpu = cuda.mem_alloc(current_batch_size * 512 * 4)  # 512 features, float32
+                    
+                    # Copy input to GPU
+                    cuda.memcpy_htod(input_gpu, pixel_values.cpu().numpy())
+                    
+                    # Set input shape using new TensorRT API
+                    if hasattr(self.image_context, 'set_input_shape'):
+                        # New TensorRT API
+                        self.image_context.set_input_shape('pixel_values', pixel_values.shape)
+                    elif hasattr(self.image_context, 'set_binding_shape'):
+                        # Legacy TensorRT API
+                        self.image_context.set_binding_shape(0, pixel_values.shape)
+                    else:
+                        # Fallback - try to get binding indices
+                        for j in range(self.image_engine.num_bindings):
+                            if self.image_engine.binding_is_input(j):
+                                self.image_context.set_binding_shape(j, pixel_values.shape)
+                                break
+                    
+                    # Run inference
+                    bindings = [int(input_gpu), int(output_gpu)]
+                    success = self.image_context.execute_v2(bindings)
+                    
+                    if not success:
+                        raise RuntimeError("TensorRT inference failed")
+                    
+                    # Copy output back
+                    output = np.empty((current_batch_size, 512), dtype=np.float32)
+                    cuda.memcpy_dtoh(output, output_gpu)
+                    
+                    # Convert to tensor and normalize
+                    image_features = torch.from_numpy(output).to(self.device)
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    
+                    all_features.append(image_features)
+                    
+                except Exception as batch_error:
+                    print(f"TensorRT batch processing failed: {batch_error}")
+                    # Fall back to PyTorch for this batch
+                    return self._encode_images_pytorch(images, batch_size)
+                    
+                finally:
+                    # Clean up GPU memory
+                    if input_gpu is not None:
+                        try:
+                            input_gpu.free()
+                        except:
+                            pass
+                    if output_gpu is not None:
+                        try:
+                            output_gpu.free()
+                        except:
+                            pass
             
-            return torch.cat(all_features, dim=0)
+            return torch.cat(all_features, dim=0) if all_features else torch.empty(0, 512).to(self.device)
             
         except Exception as e:
             print(f"TensorRT image encoding failed: {e}, falling back to PyTorch")

@@ -28,7 +28,6 @@ from supervision.detection.core import Detections
 from supervision.keypoint.core import KeyPoints
 from validator.evaluation.bbox_clip import batch_classify_rois as orig_batch_classify_rois, BoundingBoxObject, OBJECT_ID_TO_ENUM, BBoxScore, extract_regions_of_interest_from_image
 import torch
-from validator.evaluation.bbox_clip import evaluate_frame,evaluate_frame_filter
 from validator.evaluation.bbox_clip import batch_evaluate_frame_filter
 
 # Override batch_classify_rois để dùng GPU nếu có

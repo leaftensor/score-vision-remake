@@ -474,13 +474,13 @@ def evaluate_frame(
         f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
         f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
     )
-    print(
-        f"Frame {frame_id}:\n"
-        f"\t-> {len(bboxes)} Bboxes predicted\n"
-        f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
-        f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
-        f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
-    )
+    # print(
+    #     f"Frame {frame_id}:\n"
+    #     f"\t-> {len(bboxes)} Bboxes predicted\n"
+    #     f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
+    #     f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
+    #     f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
+    # )
     return scaled_score
 
 # Mapping from expected_label to class_id
@@ -498,185 +498,6 @@ EXPECTED_LABEL_TO_CLASS_ID = {
     BoundingBoxObject.NOTFOOT: -1,
     BoundingBoxObject.BLACK: -1,
 }
-
-def evaluate_frame_filter(
-    frame_id:int,
-    image_array:ndarray,
-    bboxes:list[dict[str,int|tuple[int,int,int,int]]]
-):
-    import time
-    start_time = time.time()
-    bboxes = [bbox for bbox in bboxes if is_bbox_large_enough(bbox) and not is_touching_scoreboard_zone(bbox, image_array.shape[1], image_array.shape[0])]
-    if not bboxes:
-        logger.info(f"Frame {frame_id}: all bboxes filtered out due to small size or corners — skipping.")
-        return 0.0
-        
-    # Nếu object đã có expected_label_raw (batch CLIP từ process_video), dùng luôn, không gọi lại CLIP
-    if all('expected_label_raw' in bbox and bbox['expected_label_raw'] is not None for bbox in bboxes):
-        expected_labels = [bbox['expected_label_raw'] for bbox in bboxes]
-    else:
-        # Logic cũ: gọi CLIP từng bước
-        rois = extract_regions_of_interest_from_image(
-            bboxes=bboxes,
-            image_array=image_array[:,:,::-1] # BGR -> RGB
-        )
-        predicted_labels = [
-            OBJECT_ID_TO_ENUM.get(bbox["class_id"], BoundingBoxObject.OTHER)
-            for bbox in bboxes
-        ]
-        # Step 1 : "person" vs "grass"
-        step1_inputs = data_processor(
-            text=["person", "grass"],
-            images=rois,
-            return_tensors="pt",
-            padding=True
-        ).to(clip_device)
-        with torch.no_grad():
-            step1_outputs = clip_model(**step1_inputs)
-            step1_probs = step1_outputs.logits_per_image.softmax(dim=1)
-        expected_labels = [None] * len(rois)
-        rois_for_person_refine = []
-        indexes_for_person_refine = []
-        # Football or other
-        ball_indexes = [i for i, pred in enumerate(predicted_labels) if pred == BoundingBoxObject.FOOTBALL]
-        person_candidate_indexes = [i for i in range(len(rois)) if i not in ball_indexes]
-        # Step 2a : FOOTBALL with new 2-step CLIP check
-        if ball_indexes:
-            if len(ball_indexes)>1:
-                logger.info(f"Frame {frame_id} has {len(ball_indexes)} footballs — keeping only the first.")
-                for i in ball_indexes[1:]:
-                    predicted_labels[i] = BoundingBoxObject.FOOTBALL  # Still count as predicted
-                    expected_labels[i] = BoundingBoxObject.NOTFOOT     # Marked as incorrect
-                ball_indexes = [ball_indexes[0]]
-            football_rois = [
-                crop_and_return_scaled_roi(image_array[:,:,::-1], bboxes[i]['bbox'], scale=SCALE_FOR_CLIP)
-                for i in ball_indexes
-            ]
-            football_rois = [roi for roi in football_rois if roi is not None]
-            # Step 1: round object
-            round_inputs = data_processor(
-                text=["a photo of a round object on grass", "a random object"],
-                images=football_rois,
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            ).to(clip_device)
-            with torch.no_grad():
-                round_outputs = clip_model(**round_inputs)
-                round_probs = round_outputs.logits_per_image.softmax(dim=1)
-            # Step 2: semantic football if round enough
-            for j, i in enumerate(ball_indexes):
-                round_prob = round_probs[j][0].item()
-                if round_prob < 0.5:
-                    expected_labels[i] = BoundingBoxObject.NOTFOOT
-                    continue
-                # Step 2 — semantic football classification
-                step2_inputs = data_processor(
-                    text=[
-                    "a small soccer ball on the field",
-                    "just grass without any ball",
-                    "other"
-                    ],
-                    images=[football_rois[j]],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True
-                ).to(clip_device)
-                with torch.no_grad():
-                    step2_outputs = clip_model(**step2_inputs)
-                    step2_probs = step2_outputs.logits_per_image.softmax(dim=1)[0]
-                pred_idx = torch.argmax(step2_probs).item()
-                if pred_idx == 0:  # ball or close-up of ball
-                    expected_labels[i] = BoundingBoxObject.FOOTBALL
-                else:
-                    expected_labels[i] = BoundingBoxObject.NOTFOOT
-        # step 2b : PERSON vs GRASS
-        for i in person_candidate_indexes:
-            person_score = step1_probs[i][0].item()
-            grass_score = step1_probs[i][1].item()
-            if person_score > 0.08:
-                rois_for_person_refine.append(rois[i])
-                indexes_for_person_refine.append(i)
-            else:
-                expected_labels[i] = BoundingBoxObject.GRASS
-        # Step 3 : PERSON final classification
-        if rois_for_person_refine:
-            person_labels = [
-                BoundingBoxObject.PLAYER.value,
-                BoundingBoxObject.GOALKEEPER.value,
-                BoundingBoxObject.REFEREE.value,
-                BoundingBoxObject.CROWD.value,
-                BoundingBoxObject.BLACK.value
-            ]
-            refine_inputs = data_processor(
-                text=person_labels,
-                images=rois_for_person_refine,
-                return_tensors="pt",
-                padding=True
-            ).to(clip_device)
-            with torch.no_grad():
-                refine_outputs = clip_model(**refine_inputs)
-                refine_probs = refine_outputs.logits_per_image.softmax(dim=1)
-                refine_preds = refine_probs.argmax(dim=1)
-            for k, idx in enumerate(indexes_for_person_refine):
-                expected_labels[idx] = BoundingBoxObject(person_labels[refine_preds[k]])
-
-    # Scoring
-    scores = []
-    for i in range(len(expected_labels)):
-        if expected_labels[i] is None:
-            continue
-        predicted = predicted_labels[i]
-        expected = expected_labels[i]
-        scores.append(
-            BBoxScore(
-                predicted_label=predicted,
-                expected_label=expected,
-                occurrence=len([
-                    s for s in scores if s.expected_label == expected
-                ])
-            )
-        )
-
-    logger.debug('\n'.join(map(str, scores)))
-    points = [score.points for score in scores]
-    total_points = sum(points)
-    n_unique_classes_detected = len(set(expected_labels) - {None})
-    normalised_score = total_points / (n_unique_classes_detected+1) if n_unique_classes_detected else 0.0
-    scale = multiplication_factor(image_array=image_array, bboxes=bboxes)
-    scaled_score = scale * normalised_score
-
-    points_with_labels = [f"{score.points:.2f} (predicted:{score.predicted_label.value})(expected:{score.expected_label.value})" for score in scores]
-    # logger.info(
-    #     f"Frame {frame_id}:\n"
-    #     f"\t-> {len(bboxes)} Bboxes predicted\n"
-    #     f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
-    #     f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
-    #     f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
-    # )
-    # print(
-    #     f"Frame {frame_id}:\n"
-    #     f"\t-> {len(bboxes)} Bboxes predicted\n"
-    #     f"\t-> sum({', '.join(points_with_labels)}) = {total_points:.2f}\n"
-    #     f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
-    #     f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
-    # )
-
-    # Only keep bboxes with score.points > 0
-    keep = [(bbox, score) for bbox, score in zip(bboxes, scores) if score.points > 0.0]
-    # Update class_id according to expected_label
-    for bbox, score in keep:
-        if score.expected_label in EXPECTED_LABEL_TO_CLASS_ID:
-            bbox["class_id"] = EXPECTED_LABEL_TO_CLASS_ID[score.expected_label]
-        # else:
-            # bbox["class_id"] = -1
-    # Move objects with predicted_label != expected_label to the end
-    correct = [bbox for bbox, score in keep if score.predicted_label.value == score.expected_label.value]
-    incorrect = [bbox for bbox, score in keep if score.predicted_label.value != score.expected_label.value]
-    keep_sorted = correct + incorrect
-    elapsed = time.time() - start_time
-    print(f"evaluate_frame_filter: frame {frame_id} processed in {elapsed:.3f} seconds")
-    return keep_sorted
 
 async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_valid:int) -> float:
     frames = prediction
@@ -1315,7 +1136,7 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         
         # Use PyTorch-only processing for stability
         if True:  # Always use PyTorch
-            clip_batch_size = 1024
+            clip_batch_size = 512
             # PyTorch path - safe inference with CUDA error handling
             print(f"[PyTorch] Processing {len(clip_rois)} ROIs with stable PyTorch (batch_size={clip_batch_size})")
             

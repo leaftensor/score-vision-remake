@@ -46,7 +46,7 @@ class ModelManager:
         """Load a YOLO model from a TensorRT .engine file."""
         logger.info(f"Loading TensorRT model from {engine_path}")
         # Ultralytics YOLO supports loading .engine directly
-        model = YOLO(str(engine_path))
+        model = YOLO(str(engine_path), task='detect')
         return model
 
     def load_model(self, model_name: str) -> YOLO:
@@ -74,7 +74,7 @@ class ModelManager:
                     "Please ensure all required models are downloaded."
                 )
             logger.info(f"Loading {model_name} model from {model_path} to {self.device}")
-            model = YOLO(str(model_path)).to(device=self.device)
+            model = YOLO(str(model_path), task='detect').to(device=self.device)
         self.models[model_name] = model
         return model
 

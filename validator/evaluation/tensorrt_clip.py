@@ -116,7 +116,7 @@ class TensorRTCLIP:
                     'pixel_values': {0: 'batch_size'},
                     'last_hidden_state': {0: 'batch_size'}
                 },
-                opset_version=11
+                opset_version=14
             )
             
             # Parse ONNX model
@@ -183,7 +183,7 @@ class TensorRTCLIP:
                     'attention_mask': {0: 'batch_size'},
                     'last_hidden_state': {0: 'batch_size'}
                 },
-                opset_version=11
+                opset_version=14
             )
             
             # Parse ONNX model

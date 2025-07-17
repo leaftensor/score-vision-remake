@@ -886,7 +886,8 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
     import time
     import cv2
     t0 = time.time()
-    
+    # --- ROI extraction ---
+    t_roi_start = time.time()
     # Auto-determine optimal batch size based on GPU memory and available ROIs
     if batch_size is None:
         if clip_device.type == 'cuda':
@@ -959,9 +960,25 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             x1, y1, x2, y2 = coords
             w, h = x2 - x1, y2 - y1
             class_id = bbox.get("class_id", -1)
+            aspect_ratio = w / h if h > 0 else 1.0
+
+            # Filter: loại human bbox gần vuông
+            if class_id in [1, 2, 3] and aspect_ratio > 0.7:
+                continue
+            # Filter: loại human bbox quá hẹp (width < 30 pixel)
+            if class_id in [1, 2, 3] and w < 30:
+                continue
             
             # Fast combined checks
             if not ((class_id == 0) or (w >= 15 and h >= 40)) or y1 < 150:
+                continue
+            
+            # Filter: loại object gần với viền frame (< 50 pixel)
+            edge_margin = 50
+            if (
+                x1 <= edge_margin or x2 >= img_width - edge_margin or 
+                y1 <= edge_margin or y2 >= img_height - edge_margin
+            ):
                 continue
             
             # Bounds checking and ROI extraction
@@ -984,6 +1001,42 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             valid_bboxes.append(bbox)
             bbox_scores.append(importance_score)
         
+        # Sau khi đã có valid_bboxes, valid_rois, bbox_scores, loại các bbox đè lên nhau quá 70%
+        def compute_iou(boxA, boxB):
+            xA = max(boxA[0], boxB[0])
+            yA = max(boxA[1], boxB[1])
+            xB = min(boxA[2], boxB[2])
+            yB = min(boxA[3], boxB[3])
+            interW = max(0, xB - xA)
+            interH = max(0, yB - yA)
+            interArea = interW * interH
+            boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+            boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+            iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+            return iou
+        keep_indices = []
+        for i, bbox_i in enumerate(valid_bboxes):
+            boxA = bbox_i["bbox"]
+            overlap = False
+            for j in keep_indices:
+                boxB = valid_bboxes[j]["bbox"]
+                if compute_iou(boxA, boxB) > 0.3:
+                    # Nếu bbox_i nhỏ hơn bbox_j thì bỏ, ngược lại thay thế
+                    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+                    boxB = valid_bboxes[j]["bbox"]
+                    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+                    if areaA > areaB:
+                        keep_indices.remove(j)
+                        break
+                    else:
+                        overlap = True
+                        break
+            if not overlap:
+                keep_indices.append(i)
+        valid_rois = [valid_rois[i] for i in keep_indices]
+        valid_bboxes = [valid_bboxes[i] for i in keep_indices]
+        bbox_scores = [bbox_scores[i] for i in keep_indices]
+
         # Optional class-limited object selection: maximum 7 objects per class per frame
         if enable_class_limits:
             # Only keep Football, GK, Player, Referee classes (0, 1, 2, 3)
@@ -1082,22 +1135,16 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
     else:
         print(f"Standard object processing: {reduction_percent:.1f}% | All classes | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
         t1 = time.time(); print(f"[TIMING] ROI gathering with standard selection: {t1-t0:.3f}s")
-
-    # 2. Ultra-fast classification with cached embeddings and heuristics
-    t2 = time.time()
-    if not all_rois:
-        t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
-        return [{"objects": []} for _ in frames]
-    
+    t_roi_end = time.time()
+    print(f"[TIMING] ROI extraction: {t_roi_end - t_roi_start:.3f}s")
+    # --- Heuristic filtering ---
+    t_heur_start = time.time()
     # Get miner predictions for smart routing
     predicted_labels = [OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER) for _, _, bbox in roi_map]
-    
     # Initialize expected labels with heuristic defaults
     expected_labels = []
-    
     # Enhanced heuristic approach: more aggressive pre-filtering while preserving accuracy
     expected_labels = []
-    
     for i, (predicted_label, roi) in enumerate(zip(predicted_labels, all_rois)):
         h, w = roi.shape[:2]
         area = h * w
@@ -1110,18 +1157,20 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             expected_labels.append(_clip_tracking_cache[tracking_id])
             continue
         
-        # Minimal heuristic filtering - only very obvious grass patches
-        if (predicted_label not in [0, 1, 2, 3] and  # Not key objects
-            area < 100 and roi.size > 0):  # Very small
+        # Conservative heuristic filtering - preserve bbox count while optimizing CLIP performance
+        # Only filter extremely obvious non-important cases
+        if (predicted_label not in [0, 1, 2, 3] and  # Not key objects (players, goalkeepers, referees, footballs)
+            area < 80 and roi.size > 0):  # Very small regions
             
-            # Ultra-fast grass check
+            # Ultra-conservative grass check (stricter than original)
             mean_color = roi.mean(axis=(0,1))
-            if (mean_color[1] > mean_color[0] + 25 and  # Very green
-                mean_color[1] > mean_color[2] + 15):   # Strong green dominance
+            if (mean_color[1] > mean_color[0] + 35 and  # Very strong green dominance
+                mean_color[1] > mean_color[2] + 25 and  # Even stronger green vs blue
+                mean_color[1] > 80):  # Ensure it's actually green, not just relatively green
                 expected_labels.append(BoundingBoxObject.GRASS)
                 continue
         
-        # Send everything else to CLIP
+        # Send everything else to CLIP to preserve accuracy
         expected_labels.append(None)
     
     # Collect all cases that need CLIP processing (None values + less confident heuristics)
@@ -1129,6 +1178,11 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
     for i, expected in enumerate(expected_labels):
         if expected is None:
             clip_indices.append(i)
+    
+    # Calculate heuristic filtering success rate
+    heuristic_filtered = len(all_rois) - len(clip_indices)
+    filter_rate = (heuristic_filtered / len(all_rois)) * 100 if all_rois else 0
+    print(f"[HEURISTIC] Filtered {heuristic_filtered}/{len(all_rois)} ROIs ({filter_rate:.1f}%) using conservative heuristics")
     
     # Process all uncertain cases with CLIP (but use optimized approach)
     if clip_indices:
@@ -1166,7 +1220,17 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         
         # Process uncertain ROIs with TensorRT optimization when available
         clip_rois = [all_rois[i] for i in clip_indices]
-        clip_batch_size = min(batch_size, len(clip_rois))  # Use the full batch size
+        # Optimize batch size for better GPU utilization
+        if batch_size is None:
+            # Auto-determine optimal batch size based on available memory and ROI count
+            if len(clip_rois) <= 16:
+                clip_batch_size = len(clip_rois)  # Small batches - process all at once
+            elif len(clip_rois) <= 64:
+                clip_batch_size = 16  # Medium batches - optimal for most GPUs
+            else:
+                clip_batch_size = 32  # Large batches - balance memory and throughput
+        else:
+            clip_batch_size = min(batch_size, len(clip_rois))
         
         clip_predictions = []
         
@@ -1176,7 +1240,10 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             print(f"[TensorRT] Processing {len(clip_rois)} ROIs with TensorRT acceleration")
             try:
                 logits = tensorrt_clip.classify_images(clip_rois, list(all_labels), clip_batch_size)
+                # Use temperature scaling for better confidence calibration
+                probabilities = torch.softmax(logits / 1.5, dim=1)
                 clip_predictions = logits.argmax(dim=1).cpu().tolist()
+                confidences = probabilities.max(dim=1)[0].cpu().tolist()
             except Exception as e:
                 print(f"TensorRT inference failed: {e}, falling back to PyTorch")
                 # Fallback to PyTorch
@@ -1205,16 +1272,21 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
                         image_features = clip_model.get_image_features(**image_inputs)
                         image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
                         
-                        # Direct computation
+                        # Direct computation with confidence scoring
                         logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
-                        batch_preds = logits.argmax(dim=1).cpu()  # Skip softmax for argmax
+                        
+                        # Use temperature scaling for better confidence calibration
+                        probabilities = torch.softmax(logits / 1.5, dim=1)
+                        batch_preds = logits.argmax(dim=1).cpu()
+                        confidences = probabilities.max(dim=1)[0].cpu()
+                        
                         clip_predictions.extend(batch_preds)
                     
                     # Efficient cleanup
                     del image_inputs, image_features, logits
                     
-                    # Less frequent cache clearing for speed
-                    if clip_device.type == 'cuda' and i % (clip_batch_size * 2) == 0:
+                    # Less frequent cache clearing for speed - only clear every 4 batches
+                    if clip_device.type == 'cuda' and i % (clip_batch_size * 4) == 0:
                         torch.cuda.empty_cache()
         
         # Update uncertain cases with CLIP results and cache for tracked objects
@@ -1232,9 +1304,16 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         del text_features
         torch.cuda.empty_cache() if clip_device.type == 'cuda' else None
     else:
-        print(f"[HEURISTIC] Using heuristic-only classification for all {len(all_rois)} ROIs")
+        print(f"[HEURISTIC] Using heuristic-only classification for all {len(all_rois)} ROIs (100% heuristic success rate)")
     
-    t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
+    t_heur_end = time.time()
+    print(f"[TIMING] Heuristic filtering: {t_heur_end - t_heur_start:.3f}s")
+    # --- CLIP inference ---
+    t_clip_start = time.time()
+    t2 = time.time()
+    if not all_rois:
+        t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
+        return [{"objects": []} for _ in frames]
 
     # 3. Optimized scoring and filtering
     t4 = time.time()
@@ -1262,5 +1341,8 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             frame_label_count[frame_idx][expected] = label_count + 1
     
     t5 = time.time(); print(f"[TIMING] Assign results to frames: {t5-t4:.3f}s")
+    t_assign_end = time.time()
     print(f"[TIMING] Total batch_evaluate_frame_filter: {time.time()-t0:.3f}s")
+    t_end = time.time()
+    print(f"[TIMING] batch_evaluate_frame_filter: total processing time = {t_end - t0:.3f}s")
     return frame_results

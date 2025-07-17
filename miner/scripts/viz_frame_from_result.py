@@ -9,7 +9,7 @@ import torch
 
 # --- Config ---
 TEST_VIDEO_URL = "https://scoredata.me/2025_06_18/2025_06_18_d49f45ff/2025_06_18_d49f45ff_195945e20e9e4325b51ab84ff134c7_dcb7b85f.mp4"
-RESULT_JSON_PATH = "C:/Users/longp/Documents/GitHub/score-vision/miner/test_outputs/pipeline_results_1752511600.json"
+RESULT_JSON_PATH = "C:/Users/longp/Documents/GitHub/score-vision/miner/test_outputs/pipeline_results_1752724503.json"
 VIDEO_LOCAL_PATH = "miner/test_outputs/temp_test_video.mp4"
 
 # --- Helper: Download video if not exists ---

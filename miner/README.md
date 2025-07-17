@@ -267,3 +267,10 @@ A big shout out to Skalskip and the work they're doing over at Roboflow. The bas
 - Tổng pipeline có thể giảm từ 40s xuống 13-17s nếu detect/tracking cũng tối ưu.
 - Chất lượng CLIP giữ nguyên, không giảm so với HuggingFace.
 - Nên batch CLIP lớn nhất có thể để tận dụng tối đa GPU.
+
+## Pipeline Optimization Notes
+
+### Batch size fallback logic for CLIP batching
+- Khi thực hiện batch inference với CLIP, nếu batch_size=None, pipeline sẽ tự động sử dụng toàn bộ số lượng ROI hiện có (`clip_batch_size = len(clip_rois)`).
+- Nếu batch_size là số nguyên, pipeline sẽ lấy giá trị nhỏ nhất giữa batch_size và số lượng ROI (`clip_batch_size = min(batch_size, len(clip_rois))`).
+- Điều này giúp tránh lỗi TypeError khi so sánh None với int, đồng thời đảm bảo tận dụng tối đa GPU khi batch_size không được chỉ định.

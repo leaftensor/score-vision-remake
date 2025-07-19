@@ -191,6 +191,15 @@ async def evaluate_detection(detection_result: Dict, video_path: str):
     """Evaluate detection results using validator."""
     logger.info("Starting detection evaluation...")
     
+    # Get video dimensions
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    logger.info(f"Video dimensions: {video_width}x{video_height}")
+    
     # Prepare GSRResponse
     response = GSRResponse(
         challenge_id="test-challenge",
@@ -218,6 +227,8 @@ async def evaluate_detection(detection_result: Dict, video_path: str):
         response=response,
         challenge=challenge,
         video_path=Path(challenge.video_url),
+        video_width=video_width,
+        video_height=video_height,
         frames_to_validate=frames_to_validate,
         selected_frames_id_bbox=selected_frames_id_bbox
     )
@@ -225,17 +236,32 @@ async def evaluate_detection(detection_result: Dict, video_path: str):
     return result
 
 def print_detailed_results(result, processing_time, total_frames, detection_result, video_path):
-    """Print comprehensive scoring results."""
-    # Extract scores
-    keypoint_final_score = result.feedback.get("keypoints_final_score", 0.0) if isinstance(result.feedback, dict) else 0.0
+    """Print comprehensive scoring results following new validator format."""
+    # Extract scores from feedback
+    feedback = result.feedback if isinstance(result.feedback, dict) else {}
+    
+    # Extract new keypoint scoring components with updated keys
+    keypoint_score = feedback.get("keypoint_score", 0.0)
+    mean_on_line = feedback.get("mean_on_line", 0.0) 
+    mean_inside = feedback.get("mean_inside", 0.0)
+    keypoint_stability = feedback.get("keypoint_stability", 0.0)
+    player_final_score = feedback.get("player_final_score", 0.0)
+    keypoints_final_score = feedback.get("keypoints_final_score", 0.0)
+    
+    # Additional scoring components from new validator
+    mean_scale = feedback.get("mean_scale", 1.0)
+    scale_valid = feedback.get("scale_valid", 1.0)
+    avg_inlier_ratio = feedback.get("avg_inlier_ratio", 0.0)
+    avg_reprojection_error = feedback.get("avg_reprojection_error", 0.0)
+    
     bbox_score = result.score
-    final_score = calculate_final_score(keypoint_final_score, bbox_score)
+    final_score = calculate_final_score(keypoints_final_score, bbox_score)
     
     # Calculate speed scores
     speed_score_validator = calculate_speed_score_validator(processing_time)
     speed_score_fps = calculate_speed_score_fps(processing_time, total_frames)
     
-    # Print results
+    # Print results with new format
     print("\n" + "="*80)
     print("COMPLETE PIPELINE RESULTS")
     print("="*80)
@@ -247,8 +273,21 @@ def print_detailed_results(result, processing_time, total_frames, detection_resu
     print(f"Speed Score (Validator method): {speed_score_validator:.4f}")
     print(f"Speed Score (FPS method): {speed_score_fps:.2f}/100")
     print("-"*80)
+    print("KEYPOINT SCORING COMPONENTS (New Weights):")
+    print(f"  Keypoint Score: {keypoint_score:.2f} (weight: 25%)")
+    print(f"  Mean On Line: {mean_on_line:.2f} (weight: 40%)")
+    print(f"  Mean Inside: {mean_inside:.2f} (weight: 20%)")
+    print(f"  Keypoint Stability: {keypoint_stability:.2f} (weight: 5%)")
+    print(f"  Player Final Score: {player_final_score:.2f} (weight: 10%)")
+    print(f"  Keypoints Final Score: {keypoints_final_score:.4f}")
+    print("-"*80)
+    print("ADDITIONAL SCORING METRICS:")
+    print(f"  Mean Scale Factor: {mean_scale:.3f}")
+    print(f"  Scale Valid Factor: {scale_valid:.3f}")
+    print(f"  Average Inlier Ratio: {avg_inlier_ratio:.3f}")
+    print(f"  Average Reprojection Error: {avg_reprojection_error:.2f} pixels")
+    print("-"*80)
     print(f"BBox Score: {bbox_score:.4f}")
-    print(f"Keypoint Score: {keypoint_final_score:.4f}")
     print(f"Final Score: {final_score:.4f}")
     print("-"*80)
     print(f"Frame scores: {result.frame_scores}")
@@ -265,7 +304,16 @@ def print_detailed_results(result, processing_time, total_frames, detection_resu
         "speed_score_validator": speed_score_validator,
         "speed_score_fps": speed_score_fps,
         "bbox_score": bbox_score,
-        "keypoint_score": keypoint_final_score,
+        "keypoint_score": keypoint_score,
+        "mean_on_line": mean_on_line,
+        "mean_inside": mean_inside,
+        "keypoint_stability": keypoint_stability,
+        "player_final_score": player_final_score,
+        "keypoints_final_score": keypoints_final_score,
+        "mean_scale": mean_scale,
+        "scale_valid": scale_valid,
+        "avg_inlier_ratio": avg_inlier_ratio,
+        "avg_reprojection_error": avg_reprojection_error,
         "final_score": final_score,
         "frame_scores": result.frame_scores,
         "feedback": result.feedback

@@ -14,7 +14,7 @@ import math
 
 # Set the test video URL and input file path
 TEST_VIDEO_URL = "https://scoredata.me/2025_06_18/2025_06_18_d49f45ff/2025_06_18_d49f45ff_195945e20e9e4325b51ab84ff134c7_dcb7b85f.mp4"
-INPUT_SCORE_FILE = r"C:\Users\longp\Documents\GitHub\score-vision\miner\test_outputs\pipeline_results_1752776711.json"
+INPUT_SCORE_FILE = r"C:\Users\longp\Documents\GitHub\score-vision\miner\test_outputs\pipeline_results_1752860308.json"
 
 # Constants from validator config
 MAX_PROCESSING_TIME = 15.0
@@ -57,14 +57,50 @@ def download_video(url):
 def calculate_final_score(keypoint_score, bbox_score):
     """
     Calculate final score based on keypoint and bbox scores.
-    Formula: final_score = 0.5 * keypoint_score + 0.5 * bbox_score
+    Updated formula to match validator's new scoring system:
+    - Quality Score = bbox_score * 0.75 + keypoint_score * 0.25
+    - This reflects the validator's emphasis on bbox accuracy
     """
-    return 0.5 * keypoint_score + 0.5 * bbox_score
+    quality_score = (bbox_score * 0.75) + (keypoint_score * 0.25)
+    return quality_score
+
+def calculate_total_final_score(quality_score, speed_score):
+    """
+    Calculate the total final score combining quality and speed.
+    Formula from validator: final_score = quality_score * 0.65 + speed_score * 0.35
+    """
+    return (quality_score * 0.65) + (speed_score * 0.35)
+
+def calculate_speed_score(processing_time: float, min_time: float, max_time: float) -> float:
+    """
+    Calculate speed score using validator's method.
+    Based on validator/evaluation/calculate_score.py - calculate_speed_score function
+    """
+    if processing_time <= 0:
+        return 0.0
+    
+    # Check if processing time exceeds maximum allowed
+    if processing_time >= MAX_PROCESSING_TIME:
+        return 0.0
+    
+    # If all processing times are the same, return 1.0
+    if max_time == min_time:
+        return 1.0
+    
+    # Normalize processing time (0 = fastest, 1 = slowest within valid range)
+    time_range = max_time - min_time
+    normalized_time = (processing_time - min_time) / time_range if time_range > 0 else 0
+    
+    # Speed score: faster is better (1 - normalized_time)
+    speed_score = 1.0 - normalized_time
+    
+    return max(0.0, min(1.0, speed_score))
 
 def calculate_speed_score_validator(processing_time: float, min_time: float = 0.0, max_time: float = 0.0) -> float:
     """
     Calculate speed score using validator's exponential scaling method.
     Based on validator/evaluation/calculate_score.py
+    DEPRECATED: Use calculate_speed_score instead for validator compatibility
     """
     if processing_time <= 0:
         return 0.0
@@ -176,6 +212,8 @@ async def main():
         response=response,
         challenge=challenge,
         video_path=Path(challenge.video_url),
+        video_width=1920,
+        video_height=1080,
         frames_to_validate=frames_to_validate,
         selected_frames_id_bbox=selected_frames_id_bbox
     )
@@ -187,49 +225,119 @@ async def main():
     # detection.get("processing_time", total_time)
     
     # Extract keypoint score from feedback
-    keypoint_final_score = result.feedback.get("keypoints_final_score", 0.0) if isinstance(result.feedback, dict) else 0.0
+    keypoints_final_score = result.feedback.get("keypoints_final_score", 0.0) if isinstance(result.feedback, dict) else 0.0
     bbox_score = result.score  # This is the bbox score from evaluate_bboxes
     
-    # Calculate final score
-    final_score = calculate_final_score(keypoint_final_score, bbox_score)
+    # Calculate quality score using new validator formula
+    quality_score = calculate_final_score(keypoints_final_score, bbox_score)
     
-    # Calculate speed scores using both methods
-    speed_score_validator = calculate_speed_score_validator(processing_time)
+    # Calculate speed score using validator method
+    # For single test, we simulate min/max times for demonstration
+    min_time = max(processing_time * 0.5, 1.0)  # Simulated best case
+    max_time = min(processing_time * 1.5, MAX_PROCESSING_TIME)  # Simulated worst case
+    speed_score_validator = calculate_speed_score(processing_time, min_time, max_time)
+    
+    # Calculate total final score (quality + speed)
+    total_final_score = calculate_total_final_score(quality_score, speed_score_validator)
+    
+    # Calculate FPS-based score for comparison
     speed_score_fps = calculate_speed_score_fps(processing_time, total_frames)
     
-    # Print detailed results
-    print("\n" + "="*60)
-    print("SCORING RESULTS")
-    print("="*60)
+    # Extract keypoint component details from feedback if available
+    feedback_dict = result.feedback if isinstance(result.feedback, dict) else {}
+    keypoint_components = feedback_dict.get("components", {})
+    
+    # Print in validator's exact format
+    print(f"bbox_score: {bbox_score}, keypoints_final_score: {keypoints_final_score}")
+    
+    # Print keypoint component scores in validator format
+    print(f"\nComponent Scores:")
+    print(f"Keypoint Score: {keypoint_components.get('avg_keypoint_score', 0.0):.2f} (weight: 0.25)")
+    print(f"Point on line Score: {keypoint_components.get('mean_on_line', 0.0)*100:.2f} (weight: 0.4)")
+    print(f"Mean inside Score: {keypoint_components.get('mean_inside', 0.0)*100:.2f} (weight: 0.2)")
+    print(f"Keypoint Stability: {0.0:.2f} (weight: 0.05)")
+    print(f"Player final score: {keypoint_components.get('player_score', 0.0):.2f} (weight: 0.1)")
+    
+    # Print validator-style detailed logs
+    print(f"\nProcessing times: Min time: {min_time}, Max time: {max_time}")
+    print(f"Final score for response test-challenge: {total_final_score}")
+    
+    # Print response scoring details in validator format
+    print(f"Response test-challenge scoring details:")
+    print(f"  - Quality score: {quality_score:.3f}")
+    print(f"  - Speed score: {speed_score_validator:.3f}")
+    print(f"  - Final score: {total_final_score:.3f}")
+    
+    # Print additional validator-style output
+    print(f"\nTotal frames processed: {total_frames}")
     print(f"Processing Time: {processing_time:.2f} seconds")
-    print(f"Total Frames: {total_frames}")
     print(f"FPS: {total_frames/processing_time:.2f}")
     print(f"MAX_PROCESSING_TIME: {MAX_PROCESSING_TIME} seconds")
-    print("-"*60)
-    print(f"Speed Score (Validator method): {speed_score_validator:.4f}")
-    print(f"Speed Score (FPS method): {speed_score_fps:.2f}/100")
-    print("-"*60)
-    print(f"BBox Score: {bbox_score:.4f}")
-    print(f"Keypoint Score: {keypoint_final_score:.4f}")
-    print(f"Final Score: {final_score:.4f}")
-    print("-"*60)
+    
+    # Print detailed breakdown for comparison
+    print("\n" + "="*70)
+    print("DETAILED SCORING BREAKDOWN (For Analysis)")
+    print("="*70)
+    print("COMPONENT SCORES:")
+    print(f"  BBox Score: {bbox_score:.4f}")
+    print(f"  Keypoint Score: {keypoints_final_score:.4f}")
+    print(f"  Quality Score (75% bbox + 25% keypoint): {quality_score:.4f}")
+    print(f"  Speed Score: {speed_score_validator:.4f}")
+    print("-"*70)
+    print("FINAL SCORES:")
+    print(f"  Total Score (65% quality + 35% speed): {total_final_score:.4f}")
+    print(f"  Speed Score (FPS method, for comparison): {speed_score_fps:.2f}/100")
+    print("-"*70)
+    print("VALIDATOR WEIGHT BREAKDOWN:")
+    print("  Quality Score = BBox(75%) + Keypoints(25%)")
+    print("    ├─ BBox: Object detection accuracy")
+    print("    └─ Keypoints: Field alignment + spatial accuracy")
+    print("      ├─ keypoint_score: 25% - Basic keypoint quality")
+    print("      ├─ mean_on_line: 40% - Distance to pitch lines")
+    print("      ├─ mean_inside: 20% - Field projection accuracy")
+    print("      ├─ keypoint_stability: 5% - Temporal consistency")
+    print("      └─ player_final_score: 10% - Player movement validation")
+    print("  Total Score = Quality(65%) + Speed(35%)")
+    print("-"*70)
     print(f"Frame scores: {result.frame_scores}")
     print(f"Feedback: {result.feedback}")
-    print("="*60)
+    print("="*70)
     
-    # Save detailed results to file
+    # Save detailed results to file with updated structure
     results_summary = {
         "timestamp": datetime.now().isoformat(),
         "video_path": video_path,
-        "processing_time": processing_time,
-        "total_frames": total_frames,
-        "fps": total_frames/processing_time,
-        "max_processing_time": MAX_PROCESSING_TIME,
-        "speed_score_validator": speed_score_validator,
-        "speed_score_fps": speed_score_fps,
-        "bbox_score": bbox_score,
-        "keypoint_score": keypoint_final_score,
-        "final_score": final_score,
+        "processing_metrics": {
+            "processing_time": processing_time,
+            "total_frames": total_frames,
+            "fps": total_frames/processing_time,
+            "max_processing_time": MAX_PROCESSING_TIME
+        },
+        "component_scores": {
+            "bbox_score": bbox_score,
+            "keypoint_score": keypoints_final_score,
+            "quality_score": quality_score,
+            "speed_score": speed_score_validator,
+            "speed_score_fps": speed_score_fps
+        },
+        "final_scores": {
+            "total_final_score": total_final_score,
+            "quality_weight": 0.65,
+            "speed_weight": 0.35
+        },
+        "validator_weights": {
+            "quality_composition": {
+                "bbox_weight": 0.75,
+                "keypoint_weight": 0.25
+            },
+            "keypoint_components": {
+                "keypoint_score": 0.25,
+                "mean_on_line": 0.40,
+                "mean_inside": 0.20,
+                "keypoint_stability": 0.05,
+                "player_final_score": 0.10
+            }
+        },
         "frame_scores": result.frame_scores,
         "feedback": result.feedback
     }

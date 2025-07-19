@@ -9,6 +9,7 @@ from math import cos, acos, exp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import cpu_count
 from time import time
+from typing import List, Dict, Optional
 
 from numpy import ndarray, zeros
 from pydantic import BaseModel, Field
@@ -16,40 +17,23 @@ from transformers import CLIPProcessor, CLIPModel
 from cv2 import VideoCapture
 from torch import no_grad
 import torch
-from typing import List, Dict
-
-# Import TensorRT optimization
-try:
-    from .tensorrt_clip import create_tensorrt_clip
-    TENSORRT_AVAILABLE = True
-except ImportError:
-    TENSORRT_AVAILABLE = False
+import numpy as np
+import cv2
 
 SCALE_FOR_CLIP = 4.0
 FRAMES_PER_VIDEO = 750
 MIN_WIDTH = 15
 MIN_HEIGHT = 40
 logger = getLogger("Bounding Box Evaluation Pipeline")
-# Chuyển model CLIP và processor sang GPU nếu có
+
+# Set up device and models properly
 clip_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(clip_device)
 data_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# Global text feature cache
+# Global caches
 _text_feature_cache = {}
-
-# CLIP result cache by tracking ID (for tracked objects)
 _clip_tracking_cache = {}
-
-# TensorRT disabled for stability - using PyTorch only
-
-# Disable TensorRT due to CUDA context corruption issues
-tensorrt_clip = None
-print("TensorRT disabled due to CUDA stability issues, using optimized PyTorch CLIP")
-
-# Set precision for better performance
-torch.set_float32_matmul_precision('high')
-print("Using optimized CLIP model with TensorRT acceleration" if tensorrt_clip else "Using standard PyTorch CLIP model")
 
 class BoundingBoxObject(Enum):
     #possible classifications identified by miners and CLIP
@@ -72,6 +56,22 @@ OBJECT_ID_TO_ENUM = {
     1:BoundingBoxObject.GOALKEEPER,
     2:BoundingBoxObject.PLAYER,
     3:BoundingBoxObject.REFEREE,
+}
+
+# Mapping from expected_label to class_id
+EXPECTED_LABEL_TO_CLASS_ID = {
+    BoundingBoxObject.FOOTBALL: 0,
+    BoundingBoxObject.GOALKEEPER: 1,
+    BoundingBoxObject.PLAYER: 2,
+    BoundingBoxObject.REFEREE: 3,
+    BoundingBoxObject.CROWD: -1,
+    BoundingBoxObject.GRASS: -1,
+    BoundingBoxObject.GOAL: -1,
+    BoundingBoxObject.BACKGROUND: -1,
+    BoundingBoxObject.BLANK: -1,
+    BoundingBoxObject.OTHER: -1,
+    BoundingBoxObject.NOTFOOT: -1,
+    BoundingBoxObject.BLACK: -1,
 }
 
 
@@ -109,7 +109,8 @@ predicted: {self.predicted_label.value}
     def validity(self) -> bool:
         """Is the Object captured by the Miner
         a valid object of interest (e.g. player, goalkeeper, football, ref)
-        or is it another object we don't care about?"""
+        or is it another object we don't care about?""
+        """
         return self.expected_label in OBJECT_ID_TO_ENUM.values()
 
     @property
@@ -193,7 +194,7 @@ async def stream_frames(video_path:Path):
 
    
 
-def multiplication_factor(image_array:ndarray, bboxes:list[dict[str,int|tuple[int,int,int,int]]]) -> float:
+def multiplication_factor(image_array:ndarray, bboxes:list[dict]) -> float:
     """Reward more targeted bbox predictions
     while penalising excessively large or numerous bbox predictions
     """
@@ -202,12 +203,14 @@ def multiplication_factor(image_array:ndarray, bboxes:list[dict[str,int|tuple[in
     for bbox in bboxes:
         if 'bbox' not in bbox:
             continue
-        x1,y1,x2,y2 = bbox['bbox']
-        w = abs(x2-x1)
-        h = abs(y2-y1)
-        a = w*h
-        total_area_bboxes += a
-        valid_bbox_count += 1
+        bbox_coords = bbox['bbox']
+        if isinstance(bbox_coords, (list, tuple)) and len(bbox_coords) == 4:
+            x1, y1, x2, y2 = bbox_coords
+            w = abs(x2-x1)
+            h = abs(y2-y1)
+            a = w*h
+            total_area_bboxes += a
+            valid_bbox_count += 1
     if valid_bbox_count==0:
         return 1.0
     height,width,_ = image_array.shape
@@ -232,18 +235,22 @@ def multiplication_factor(image_array:ndarray, bboxes:list[dict[str,int|tuple[in
     return scaling_factor
 
 def batch_classify_rois(regions_of_interest:list[ndarray]) -> list[BoundingBoxObject]:
-    """Use CLIP to classify a batch of images (on GPU if available)"""
+    """Use CLIP to classify a batch of images"""
     model_inputs = data_processor(
         text=[key.value for key in BoundingBoxObject],
         images=regions_of_interest,
         return_tensors="pt",
         padding=True
     ).to(clip_device)
-    with torch.no_grad():
+    with no_grad():
         model_outputs = clip_model(**model_inputs)
         probabilities = model_outputs.logits_per_image.softmax(dim=1)
         object_ids = probabilities.argmax(dim=1)
-    return [OBJECT_ID_TO_ENUM.get(object_id.item(), BoundingBoxObject.OTHER) for object_id in object_ids]
+    logger.debug(f"Indexes predicted by CLIP: {object_ids}")
+    return [
+        OBJECT_ID_TO_ENUM.get(object_id.item(), BoundingBoxObject.OTHER)
+        for object_id in object_ids
+    ]
 
 def crop_and_return_scaled_roi(image: ndarray, bbox: tuple[int, int, int, int], scale: float) -> ndarray | None:
     x1, y1, x2, y2 = map(float, bbox)
@@ -268,25 +275,21 @@ def crop_and_return_scaled_roi(image: ndarray, bbox: tuple[int, int, int, int], 
 def extract_regions_of_interest_from_image(bboxes:list[dict], image_array:ndarray) -> list[ndarray]:
     rois = []
     for bbox in bboxes:
-        coords = bbox['bbox']
-        if isinstance(coords, (list, tuple)) and len(coords) == 4:
-            x1 = int(coords[0])
-            y1 = int(coords[1])
-            x2 = int(coords[2])
-            y2 = int(coords[3])
+        bbox_coords = bbox['bbox']
+        if isinstance(bbox_coords, (list, tuple)) and len(bbox_coords) == 4:
+            x1 = int(bbox_coords[0])
+            y1 = int(bbox_coords[1])
+            x2 = int(bbox_coords[2])
+            y2 = int(bbox_coords[3])
             roi = image_array[y1:y2, x1:x2, :].copy() 
             rois.append(roi)
             image_array[y1:y2, x1:x2, :] = 0  
     return rois
   
 def is_bbox_large_enough(bbox_dict):
-    coords = bbox_dict["bbox"]
-    if not (isinstance(coords, (list, tuple)) and len(coords) == 4):
-        return False
-    x1, y1, x2, y2 = coords
+    x1, y1, x2, y2 = bbox_dict["bbox"]
     w, h = x2 - x1, y2 - y1
-    class_id = bbox_dict.get("class_id", -1)
-    if class_id == 0:  # FOOTBALL
+    if bbox_dict["class_id"] == 0:  # FOOTBALL
         return True
     return w >= MIN_WIDTH and h >= MIN_HEIGHT
 
@@ -305,7 +308,7 @@ def is_touching_scoreboard_zone(bbox_dict, frame_width=1280, frame_height=720):
 def evaluate_frame(
     frame_id:int,
     image_array:ndarray,
-    bboxes:list[dict[str,int|tuple[int,int,int,int]]]
+    bboxes:list[dict]
 ) -> float:
     object_counts = {
         BoundingBoxObject.FOOTBALL: 0,
@@ -325,7 +328,7 @@ def evaluate_frame(
     )
 
     predicted_labels = [
-        OBJECT_ID_TO_ENUM.get(bbox["class_id"], BoundingBoxObject.OTHER)
+        OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER)
         for bbox in bboxes
     ]
 
@@ -336,11 +339,11 @@ def evaluate_frame(
         return_tensors="pt",
         padding=True
     ).to(clip_device)
-    with torch.no_grad():
+    with no_grad():
         step1_outputs = clip_model(**step1_inputs)
         step1_probs = step1_outputs.logits_per_image.softmax(dim=1)
 
-    expected_labels: list[BoundingBoxObject] = [None] * len(rois)
+    expected_labels: list[Optional[BoundingBoxObject]] = [None] * len(rois)
     rois_for_person_refine = []
     indexes_for_person_refine = []
 
@@ -360,6 +363,7 @@ def evaluate_frame(
         football_rois = [
             crop_and_return_scaled_roi(image_array[:,:,::-1], bboxes[i]['bbox'], scale=SCALE_FOR_CLIP)
             for i in ball_indexes
+            if isinstance(bboxes[i]['bbox'], (list, tuple)) and len(bboxes[i]['bbox']) == 4
         ]
         football_rois = [roi for roi in football_rois if roi is not None]
 
@@ -372,40 +376,42 @@ def evaluate_frame(
             truncation=True
         ).to(clip_device)
 
-        with torch.no_grad():
+        with no_grad():
             round_outputs = clip_model(**round_inputs)
             round_probs = round_outputs.logits_per_image.softmax(dim=1)
 
         # Step 2: semantic football if round enough
         for j, i in enumerate(ball_indexes):
-            round_prob = round_probs[j][0].item()
+            if j < len(round_probs):
+                round_prob = round_probs[j][0].item()
 
-            if round_prob < 0.5:
-                expected_labels[i] = BoundingBoxObject.NOTFOOT
-                continue
+                if round_prob < 0.5:
+                    expected_labels[i] = BoundingBoxObject.NOTFOOT
+                    continue
 
-            # Step 2 — semantic football classification
-            step2_inputs = data_processor(
-                text=[
-                "a small soccer ball on the field",
-                "just grass without any ball",
-                "other"
-                ],
-                images=[football_rois[j]],
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            ).to(clip_device)
+                # Step 2 — semantic football classification
+                if j < len(football_rois):
+                    step2_inputs = data_processor(
+                        text=[
+                        "a small soccer ball on the field",
+                        "just grass without any ball",
+                        "other"
+                        ],
+                        images=[football_rois[j]],
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True
+                    ).to(clip_device)
 
-            with torch.no_grad():
-                step2_outputs = clip_model(**step2_inputs)
-                step2_probs = step2_outputs.logits_per_image.softmax(dim=1)[0]
+                    with no_grad():
+                        step2_outputs = clip_model(**step2_inputs)
+                        step2_probs = step2_outputs.logits_per_image.softmax(dim=1)[0]
 
-            pred_idx = torch.argmax(step2_probs).item()
-            if pred_idx == 0:  # ball or close-up of ball
-                expected_labels[i] = BoundingBoxObject.FOOTBALL
-            else:
-                expected_labels[i] = BoundingBoxObject.NOTFOOT
+                    pred_idx = torch.argmax(step2_probs).item()
+                    if pred_idx == 0:  # ball or close-up of ball
+                        expected_labels[i] = BoundingBoxObject.FOOTBALL
+                    else:
+                        expected_labels[i] = BoundingBoxObject.NOTFOOT
 
     # step 2b : PERSON vs GRASS
     for i in person_candidate_indexes:
@@ -432,7 +438,7 @@ def evaluate_frame(
             return_tensors="pt",
             padding=True
         ).to(clip_device)
-        with torch.no_grad():
+        with no_grad():
             refine_outputs = clip_model(**refine_inputs)
             refine_probs = refine_outputs.logits_per_image.softmax(dim=1)
             refine_preds = refine_probs.argmax(dim=1)
@@ -447,7 +453,6 @@ def evaluate_frame(
             continue
         predicted = predicted_labels[i]
         expected = expected_labels[i]
-        # print(predicted, expected)
         scores.append(
             BBoxScore(
                 predicted_label=predicted,
@@ -466,7 +471,7 @@ def evaluate_frame(
     scale = multiplication_factor(image_array=image_array, bboxes=bboxes)
     scaled_score = scale * normalised_score
 
-    points_with_labels = [f"{score.points:.2f} (predicted:{score.predicted_label.value})(expected:{score.expected_label.value})" for score in scores]
+    points_with_labels = [f"{score.points:.2f} ({score.expected_label.value})" for score in scores]
     logger.info(
         f"Frame {frame_id}:\n"
         f"\t-> {len(bboxes)} Bboxes predicted\n"
@@ -474,6 +479,7 @@ def evaluate_frame(
         f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
         f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
     )
+
     print(
         f"Frame {frame_id}:\n"
         f"\t-> {len(bboxes)} Bboxes predicted\n"
@@ -481,23 +487,10 @@ def evaluate_frame(
         f"\t-> (normalised by {n_unique_classes_detected} classes detected) = {normalised_score:.2f}\n"
         f"\t-> (Scaled by factor {scale:.2f}) = {scaled_score:.2f}"
     )
+
     return scaled_score
 
-# Mapping from expected_label to class_id
-EXPECTED_LABEL_TO_CLASS_ID = {
-    BoundingBoxObject.FOOTBALL: 0,
-    BoundingBoxObject.GOALKEEPER: 1,
-    BoundingBoxObject.PLAYER: 2,
-    BoundingBoxObject.REFEREE: 3,
-    BoundingBoxObject.CROWD: -1,
-    BoundingBoxObject.GRASS: -1,
-    BoundingBoxObject.GOAL: -1,
-    BoundingBoxObject.BACKGROUND: -1,
-    BoundingBoxObject.BLANK: -1,
-    BoundingBoxObject.OTHER: -1,
-    BoundingBoxObject.NOTFOOT: -1,
-    BoundingBoxObject.BLACK: -1,
-}
+
 
 async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_valid:int) -> float:
     frames = prediction
@@ -523,9 +516,7 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
         k=min(n_frames,len(frames_ids_which_can_be_validated))
     )
 
-    if len(frame_ids_to_evaluate)/n_valid<0.7:
-        logger.warning(f"Only having {len(frame_ids_to_evaluate)} which is not enough for the threshold")
-        return 0.0
+    scale_valid =  np.clip((len(frame_ids_to_evaluate)/n_valid) / 0.7, 0, 1)
         
     if not any(frame_ids_to_evaluate):
         logger.warning("""
@@ -541,7 +532,7 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
         """)
         return 0.0
 
-    n_threads = min(cpu_count(),len(frame_ids_to_evaluate))
+    n_threads = min(cpu_count() or 1, len(frame_ids_to_evaluate))
     logger.info(f"Loading Video: {path_video} to evaluate {len(frame_ids_to_evaluate)} frames (using {n_threads} threads)...")
     scores = []
     with ThreadPoolExecutor(max_workers=n_threads) as executor:
@@ -562,30 +553,23 @@ async def evaluate_bboxes(prediction:dict, path_video:Path, n_frames:int, n_vali
             logger.warning(f"Error while getting score from future: {e}")
 
     average_score = sum(scores)/len(scores) if scores else 0.0
+    average_score = min(1.0,average_score) * scale_valid
     logger.info(f"Average Score: {average_score:.2f} when evaluated on {len(scores)} frames")
     return max(0.0,min(1.0,round(average_score,2)))
 
-
-import numpy as np
-import time
-
 def get_cached_text_features(labels_tuple):
     """Get cached text features or compute and cache them"""
-    global _text_feature_cache, tensorrt_clip
+    global _text_feature_cache
     
     if labels_tuple in _text_feature_cache:
         return _text_feature_cache[labels_tuple]
     
-    # Use TensorRT if available, otherwise fallback to PyTorch
-    if tensorrt_clip is not None:
-        text_features = tensorrt_clip.get_cached_text_features(labels_tuple)
-    else:
-        # Compute text features with PyTorch
-        text_inputs = data_processor(text=list(labels_tuple), return_tensors="pt", padding=True).to(clip_device)
-        with torch.no_grad():
-            text_features = clip_model.get_text_features(**text_inputs)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        del text_inputs
+    # Compute text features with PyTorch
+    text_inputs = data_processor(text=list(labels_tuple), return_tensors="pt", padding=True).to(clip_device)
+    with torch.no_grad():
+        text_features = clip_model.get_text_features(**text_inputs)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    del text_inputs
     
     # Cache the result
     _text_feature_cache[labels_tuple] = text_features
@@ -629,17 +613,19 @@ def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
             score += 5.0
     
     # 3. Enhanced position scoring - prioritize action areas
-    center_x = (bbox["bbox"][0] + bbox["bbox"][2]) / 2
-    center_y = (bbox["bbox"][1] + bbox["bbox"][3]) / 2
-    
-    # Distance from center (normalized)
-    dx = abs(center_x - img_width/2) / (img_width/2)
-    dy = abs(center_y - img_height/2) / (img_height/2)
-    center_distance = (dx + dy) / 2
-    
-    # Closer to center = higher score (main action area)
-    position_score = (1.0 - center_distance) * 30.0
-    score += position_score
+    bbox_coords = bbox["bbox"]
+    if isinstance(bbox_coords, (list, tuple)) and len(bbox_coords) == 4:
+        center_x = (bbox_coords[0] + bbox_coords[2]) / 2
+        center_y = (bbox_coords[1] + bbox_coords[3]) / 2
+        
+        # Distance from center (normalized)
+        dx = abs(center_x - img_width/2) / (img_width/2)
+        dy = abs(center_y - img_height/2) / (img_height/2)
+        center_distance = (dx + dy) / 2
+        
+        # Closer to center = higher score (main action area)
+        position_score = (1.0 - center_distance) * 30.0
+        score += position_score
     
     # 4. Enhanced aspect ratio scoring - class-specific optimal ratios
     aspect_ratio = w / h if h > 0 else 1.0
@@ -664,15 +650,16 @@ def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
         score += 100.0  # Higher bonus for tracked objects (continuity)
     
     # 6. Object completeness scoring - prefer objects not at image edges
-    x1, y1, x2, y2 = bbox["bbox"]
-    edge_margin = 20  # pixels
-    
-    # Check if object is cut off at edges
-    if (x1 <= edge_margin or x2 >= img_width - edge_margin or 
-        y1 <= edge_margin or y2 >= img_height - edge_margin):
-        score -= 20.0  # Penalty for edge objects (likely cut off)
-    else:
-        score += 10.0  # Bonus for complete objects
+    if isinstance(bbox_coords, (list, tuple)) and len(bbox_coords) == 4:
+        x1, y1, x2, y2 = bbox_coords
+        edge_margin = 20  # pixels
+        
+        # Check if object is cut off at edges
+        if (x1 <= edge_margin or x2 >= img_width - edge_margin or 
+            y1 <= edge_margin or y2 >= img_height - edge_margin):
+            score -= 20.0  # Penalty for edge objects (likely cut off)
+        else:
+            score += 10.0  # Bonus for complete objects
     
     # 7. Enhanced quality penalties for poor detections
     if area < 100:  # Very tiny objects
@@ -687,193 +674,14 @@ def calculate_bbox_importance(bbox, w, h, img_width, img_height, class_id):
     
     return max(10.0, score)  # Ensure minimum score to avoid filtering too aggressively
 
-def hierarchical_classification_pipeline(roi_map, all_rois, images):
-    """
-    Hierarchical Intelligence Pipeline - Multi-stage classification
-    Returns expected_labels with hierarchical filtering results
-    """
-    import time
-    import numpy as np
-    
-    print(f"[HIERARCHICAL] Starting multi-stage classification pipeline for {len(all_rois)} ROIs")
-    
-    expected_labels = []
-    stage1_filtered = 0
-    stage2_filtered = 0
-    
-    # STAGE 1: Ultra-Fast Heuristics (0.1ms per ROI)
-    t_stage1_start = time.time()
-    stage1_results = []
-    
-    for i, roi in enumerate(all_rois):
-        frame_idx, obj_idx, bbox = roi_map[i]
-        predicted_class = bbox.get("class_id", -1)
-        predicted_label = OBJECT_ID_TO_ENUM.get(predicted_class, BoundingBoxObject.OTHER)
-        
-        # Get basic ROI properties
-        h, w = roi.shape[:2]
-        area = h * w
-        
-        # Get frame dimensions and bbox coordinates
-        frame_height, frame_width = images[frame_idx].shape[:2]
-        bbox_coords = bbox.get("bbox", [0, 0, 0, 0])
-        
-        stage1_confident = False
-        
-        # AGGRESSIVE Ultra-fast spatial filter (targeting 30-40% filtering rate)
-        if len(bbox_coords) == 4:
-            x1, y1, x2, y2 = bbox_coords
-            y_center = y1 + (y2 - y1) // 2
-            x_center = x1 + (x2 - x1) // 2
-            
-            # Much more aggressive spatial filtering
-            if predicted_label == BoundingBoxObject.PLAYER:
-                # Top 20% = likely crowd (more aggressive)
-                if y_center < frame_height * 0.20:
-                    stage1_results.append(BoundingBoxObject.CROWD)
-                    stage1_confident = True
-                    stage1_filtered += 1
-                # Bottom 10% = likely UI elements (more aggressive)
-                elif y_center > frame_height * 0.90:
-                    stage1_results.append(BoundingBoxObject.OTHER)
-                    stage1_confident = True
-                    stage1_filtered += 1
-                # Left/Right edges = likely crowd/UI (new filter)
-                elif x_center < frame_width * 0.05 or x_center > frame_width * 0.95:
-                    stage1_results.append(BoundingBoxObject.CROWD)
-                    stage1_confident = True
-                    stage1_filtered += 1
-        
-        # AGGRESSIVE Ultra-fast size filter (targeting more filtering)
-        if not stage1_confident:
-            if area < 800:  # Increase threshold = more aggressive
-                stage1_results.append(BoundingBoxObject.OTHER)
-                stage1_confident = True
-                stage1_filtered += 1
-            elif area > 40000:  # Decrease threshold = more aggressive
-                stage1_results.append(BoundingBoxObject.BACKGROUND)
-                stage1_confident = True
-                stage1_filtered += 1
-        
-        # AGGRESSIVE Aspect ratio filter (new aggressive filter)
-        if not stage1_confident and h > 0 and w > 0:
-            aspect_ratio = w / h
-            if aspect_ratio > 5.0:  # Very wide = likely line/background
-                stage1_results.append(BoundingBoxObject.BACKGROUND)
-                stage1_confident = True
-                stage1_filtered += 1
-            elif aspect_ratio < 0.2:  # Very tall = likely line/noise
-                stage1_results.append(BoundingBoxObject.OTHER)
-                stage1_confident = True
-                stage1_filtered += 1
-        
-        if stage1_confident:
-            expected_labels.append(stage1_results[-1])
-        else:
-            stage1_results.append(None)
-            expected_labels.append(None)  # Will be processed in stage 2
-    
-    t_stage1_end = time.time()
-    print(f"[HIERARCHICAL] Stage 1 filtered: {stage1_filtered} ROIs in {(t_stage1_end - t_stage1_start)*1000:.1f}ms")
-    
-    # STAGE 2: Visual Feature Analysis (1ms per ROI)
-    t_stage2_start = time.time()
-    stage2_results = []
-    
-    for i, (stage1_result, roi) in enumerate(zip(stage1_results, all_rois)):
-        if stage1_result is not None:
-            stage2_results.append(stage1_result)
-            continue
-            
-        frame_idx, obj_idx, bbox = roi_map[i]
-        predicted_class = bbox.get("class_id", -1)
-        predicted_label = OBJECT_ID_TO_ENUM.get(predicted_class, BoundingBoxObject.OTHER)
-        
-        # Get ROI properties
-        h, w = roi.shape[:2]
-        area = h * w
-        
-        stage2_confident = False
-        
-        # AGGRESSIVE Visual feature analysis (targeting 20-30% additional filtering)
-        if roi.size > 0:
-            mean_color = roi.mean(axis=(0,1))
-            std_color = roi.std(axis=(0,1))
-            
-            # Much more aggressive color-based filtering
-            if predicted_label == BoundingBoxObject.PLAYER:
-                # Green = grass with lower threshold (more aggressive)
-                green_dominance = mean_color[1] - max(mean_color[0], mean_color[2])
-                if green_dominance > 20:  # Much lower threshold
-                    stage2_results.append(BoundingBoxObject.GRASS)
-                    stage2_confident = True
-                    stage2_filtered += 1
-                # Dark regions = shadow with higher threshold (more aggressive)
-                elif mean_color.max() < 50:  # Higher threshold
-                    stage2_results.append(BoundingBoxObject.OTHER)
-                    stage2_confident = True
-                    stage2_filtered += 1
-                # Very bright regions = background
-                elif mean_color.min() > 180:  # New filter
-                    stage2_results.append(BoundingBoxObject.BACKGROUND)
-                    stage2_confident = True
-                    stage2_filtered += 1
-                # Low color variance = likely uniform background
-                elif std_color.mean() < 15:  # New filter
-                    stage2_results.append(BoundingBoxObject.BACKGROUND)
-                    stage2_confident = True
-                    stage2_filtered += 1
-        
-        # AGGRESSIVE Size-based filtering for stage 2
-        if not stage2_confident:
-            if predicted_label == BoundingBoxObject.PLAYER:
-                if area < 600:  # Increase threshold = more aggressive
-                    stage2_results.append(BoundingBoxObject.OTHER)
-                    stage2_confident = True
-                    stage2_filtered += 1
-                elif area > 35000:  # Decrease threshold = more aggressive
-                    stage2_results.append(BoundingBoxObject.CROWD)
-                    stage2_confident = True
-                    stage2_filtered += 1
-            # Apply size filters to all classes, not just PLAYER
-            elif area < 300:  # Very small objects
-                stage2_results.append(BoundingBoxObject.OTHER)
-                stage2_confident = True
-                stage2_filtered += 1
-            elif area > 50000:  # Very large objects
-                stage2_results.append(BoundingBoxObject.BACKGROUND)
-                stage2_confident = True
-                stage2_filtered += 1
-        
-        if stage2_confident:
-            expected_labels[i] = stage2_results[-1]
-        else:
-            stage2_results.append(None)
-            # Will be processed by CLIP in stage 3
-    
-    t_stage2_end = time.time()
-    print(f"[HIERARCHICAL] Stage 2 filtered: {stage2_filtered} ROIs in {(t_stage2_end - t_stage2_start)*1000:.1f}ms")
-    
-    # Calculate how many ROIs need CLIP processing (Stage 3)
-    clip_needed = sum(1 for label in expected_labels if label is None)
-    total_hierarchical_filtered = stage1_filtered + stage2_filtered
-    hierarchical_success_rate = (total_hierarchical_filtered / len(all_rois)) * 100 if all_rois else 0
-    
-    print(f"[HIERARCHICAL] Total filtered: {total_hierarchical_filtered}/{len(all_rois)} ROIs ({hierarchical_success_rate:.1f}%)")
-    print(f"[HIERARCHICAL] CLIP processing needed: {clip_needed} ROIs")
-    
-    return expected_labels
-
-def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: int = None, enable_class_limits: bool = False):
+def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], batch_size: Optional[int] = None, enable_class_limits: bool = False):
     """
     Batch evaluate frame filter with optional class limiting.
     """
     import time
-    import cv2
     global clip_device
     t0 = time.time()
-    # --- ROI extraction ---
-    t_roi_start = time.time()
+    
     # Auto-determine optimal batch size based on GPU memory and available ROIs
     if batch_size is None:
         if clip_device.type == 'cuda':
@@ -1008,9 +816,6 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         valid_bboxes = [valid_bboxes[i] for i in keep_indices]
         bbox_scores = [bbox_scores[i] for i in keep_indices]
 
-        # CLASS LIMITS FILTER REMOVED - Keep all valid objects without limits
-        # The enable_class_limits filter has been completely removed to allow maximum objects
-        
         total_valid_bboxes += len(valid_bboxes)
         
         # Add to global lists efficiently
@@ -1021,22 +826,12 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             
     reduction_percent = (1.0 - total_valid_bboxes / total_bboxes) * 100 if total_bboxes > 0 else 0
     print(f"Total frames: {len(frames)} | Total bboxes: {total_bboxes} | Valid bboxes: {total_valid_bboxes} | Valid ROIs: {total_valid_rois}")
+    print(f"RELAXED object processing: {reduction_percent:.1f}% | All classes | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
     
-    if enable_class_limits:
-        print(f"RELAXED 4-class selection: {reduction_percent:.1f}% | Max 12 best per class | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
-        t1 = time.time(); print(f"[TIMING] ROI gathering with relaxed 4-class selection: {t1-t0:.3f}s")
-    else:
-        print(f"RELAXED object processing: {reduction_percent:.1f}% | All classes | Avg objects per frame: {total_valid_bboxes/len(frames):.1f}")
-        t1 = time.time(); print(f"[TIMING] ROI gathering with relaxed selection: {t1-t0:.3f}s")
-    t_roi_end = time.time()
-    print(f"[TIMING] ROI extraction: {t_roi_end - t_roi_start:.3f}s")
-    # --- Heuristic filtering ---
-    t_heur_start = time.time()
     # Get miner predictions for smart routing
     predicted_labels = [OBJECT_ID_TO_ENUM.get(bbox.get("class_id", -1), BoundingBoxObject.OTHER) for _, _, bbox in roi_map]
+    
     # Initialize expected labels with heuristic defaults
-    expected_labels = []
-    # VERY RELAXED heuristic approach - keep most objects for CLIP
     expected_labels = []
     for i, (predicted_label, roi) in enumerate(zip(predicted_labels, all_rois)):
         h, w = roi.shape[:2]
@@ -1050,7 +845,7 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             continue
         
         # VERY MINIMAL heuristic filtering - only obvious non-objects
-        if (predicted_label not in [0, 1, 2, 3] and  # Not key objects
+        if (predicted_label not in [BoundingBoxObject.FOOTBALL, BoundingBoxObject.GOALKEEPER, BoundingBoxObject.PLAYER, BoundingBoxObject.REFEREE] and
             area < 50 and roi.size > 0):  # Very small areas only
             
             # Ultra-fast grass check - but more lenient
@@ -1069,8 +864,7 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         if expected is None:
             clip_indices.append(i)
     
-    # ... rest of CLIP processing remains the same ...
-    # Process all uncertain cases with CLIP (but use optimized approach)
+    # Process uncertain cases with CLIP
     if clip_indices:
         print(f"[CLIP] Processing {len(clip_indices)} uncertain ROIs out of {len(all_rois)}")
         
@@ -1104,112 +898,82 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
         # Use cached text features for massive speedup
         text_features = get_cached_text_features(all_labels)
         
-        # Process uncertain ROIs with TensorRT optimization when available
+        # Process uncertain ROIs
         clip_rois = [all_rois[i] for i in clip_indices]
-        # Optimize batch size for better GPU utilization and memory efficiency
-        if batch_size is None:
-            # Dynamic batch sizing based on ROI count and available memory
-            if len(clip_rois) <= 8:
-                clip_batch_size = len(clip_rois)  # Very small batches - process all at once
-            elif len(clip_rois) <= 32:
-                clip_batch_size = 8  # Small batches - good for memory efficiency
-            elif len(clip_rois) <= 128:
-                clip_batch_size = 16  # Medium batches - optimal for most GPUs
-            elif len(clip_rois) <= 512:
-                clip_batch_size = 32  # Large batches - balance memory and throughput
-            else:
-                clip_batch_size = 64  # Very large batches - maximize throughput
-        else:
-            clip_batch_size = min(batch_size, len(clip_rois))
+        clip_batch_size = min(batch_size, len(clip_rois))
         
         clip_predictions = []
         
-        # Use PyTorch-only processing for stability
-        if True:  # Always use PyTorch
-            clip_batch_size = 512
-            # PyTorch path - safe inference with CUDA error handling
-            print(f"[PyTorch] Processing {len(clip_rois)} ROIs with stable PyTorch (batch_size={clip_batch_size})")
-            
-            # Try CUDA first, fall back to CPU if CUDA context is corrupted
-            try:
-                # Check if CUDA is available and working
-                if clip_device.type == 'cuda':
-                    # Test CUDA availability
-                    torch.cuda.current_device()
-                    
-                with torch.amp.autocast('cuda') if clip_device.type == 'cuda' else torch.no_grad():
-                    for i in range(0, len(clip_rois), clip_batch_size):
-                        batch_rois = clip_rois[i:i+clip_batch_size]
-                        
-                        with torch.no_grad():
-                            try:
-                                # Try CUDA processing
-                                image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
-                                image_features = clip_model.get_image_features(**image_inputs)
-                                image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
-                                
-                                # Direct computation with confidence scoring
-                                logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
-                                
-                                # Use temperature scaling for better confidence calibration
-                                probabilities = torch.softmax(logits / 1.5, dim=1)
-                                batch_preds = logits.argmax(dim=1).cpu()
-                                confidences = probabilities.max(dim=1)[0].cpu()
-                                
-                                clip_predictions.extend(batch_preds)
-                                
-                                # Efficient cleanup
-                                del image_inputs, image_features, logits
-                                
-                            except torch.cuda.OutOfMemoryError:
-                                print(f"[WARNING] CUDA out of memory, reducing batch size")
-                                # Try with smaller batch size
-                                for j in range(0, len(batch_rois), max(1, clip_batch_size // 2)):
-                                    mini_batch = batch_rois[j:j+max(1, clip_batch_size // 2)]
-                                    image_inputs = data_processor(images=mini_batch, return_tensors="pt").to(clip_device)
-                                    image_features = clip_model.get_image_features(**image_inputs)
-                                    image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
-                                    logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
-                                    batch_preds = logits.argmax(dim=1).cpu()
-                                    clip_predictions.extend(batch_preds)
-                                    del image_inputs, image_features, logits
-                                    
-                        # Conservative memory management
-                        if clip_device.type == 'cuda' and i % (clip_batch_size * 4) == 0:
-                            torch.cuda.empty_cache()
-                            
-            except Exception as cuda_error:
-                print(f"[ERROR] CUDA processing failed: {cuda_error}")
-                print(f"[FALLBACK] Switching to CPU processing")
+        # PyTorch path - safe inference
+        print(f"[PyTorch] Processing {len(clip_rois)} ROIs with PyTorch (batch_size={clip_batch_size})")
+        
+        try:
+            for i in range(0, len(clip_rois), clip_batch_size):
+                batch_rois = clip_rois[i:i+clip_batch_size]
                 
-                # Switch to CPU processing
-                cpu_device = torch.device('cpu')
-                cpu_model = clip_model.cpu()
-                
-                clip_predictions = []
-                for i in range(0, len(clip_rois), clip_batch_size):
-                    batch_rois = clip_rois[i:i+clip_batch_size]
-                    
-                    with torch.no_grad():
-                        image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(cpu_device)
-                        image_features = cpu_model.get_image_features(**image_inputs)
+                with torch.no_grad():
+                    try:
+                        image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(clip_device)
+                        image_features = clip_model.get_image_features(**image_inputs)
                         image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
                         
-                        # Move text features to CPU
-                        cpu_text_features = text_features.cpu()
-                        logits = torch.matmul(image_features, cpu_text_features.T) * cpu_model.logit_scale.exp()
-                        batch_preds = logits.argmax(dim=1)
+                        # Direct computation
+                        logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
+                        batch_preds = logits.argmax(dim=1).cpu()
                         clip_predictions.extend(batch_preds)
                         
+                        # Efficient cleanup
                         del image_inputs, image_features, logits
+                        
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"[WARNING] CUDA out of memory, reducing batch size")
+                        # Try with smaller batch size
+                        for j in range(0, len(batch_rois), max(1, clip_batch_size // 2)):
+                            mini_batch = batch_rois[j:j+max(1, clip_batch_size // 2)]
+                            image_inputs = data_processor(images=mini_batch, return_tensors="pt").to(clip_device)
+                            image_features = clip_model.get_image_features(**image_inputs)
+                            image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+                            logits = torch.matmul(image_features, text_features.T) * clip_model.logit_scale.exp()
+                            batch_preds = logits.argmax(dim=1).cpu()
+                            clip_predictions.extend(batch_preds)
+                            del image_inputs, image_features, logits
+                            
+                # Conservative memory management
+                if clip_device.type == 'cuda' and i % (clip_batch_size * 4) == 0:
+                    torch.cuda.empty_cache()
+                    
+        except Exception as cuda_error:
+            print(f"[ERROR] CUDA processing failed: {cuda_error}")
+            print(f"[FALLBACK] Switching to CPU processing")
+            
+            # Switch to CPU processing
+            cpu_device = torch.device('cpu')
+            cpu_model = clip_model.cpu()
+            
+            clip_predictions = []
+            for i in range(0, len(clip_rois), clip_batch_size):
+                batch_rois = clip_rois[i:i+clip_batch_size]
                 
-                # Move model back to GPU if possible
-                try:
-                    clip_model.to(clip_device)
-                    print(f"[INFO] Model moved back to {clip_device}")
-                except:
-                    print(f"[WARNING] Could not move model back to GPU, staying on CPU")
-                    clip_device = torch.device('cpu')
+                with torch.no_grad():
+                    image_inputs = data_processor(images=batch_rois, return_tensors="pt").to(cpu_device)
+                    image_features = cpu_model.get_image_features(**image_inputs)
+                    image_features = torch.nn.functional.normalize(image_features, p=2, dim=-1)
+                    
+                    # Move text features to CPU
+                    cpu_text_features = text_features.cpu()
+                    logits = torch.matmul(image_features, cpu_text_features.T) * cpu_model.logit_scale.exp()
+                    batch_preds = logits.argmax(dim=1)
+                    clip_predictions.extend(batch_preds)
+                    
+                    del image_inputs, image_features, logits
+            
+            # Move model back to GPU if possible
+            try:
+                clip_model.to(clip_device)
+                print(f"[INFO] Model moved back to {clip_device}")
+            except:
+                print(f"[WARNING] Could not move model back to GPU, staying on CPU")
+                clip_device = torch.device('cpu')
         
         # Update uncertain cases with CLIP results and cache for tracked objects
         for j, roi_idx in enumerate(clip_indices):
@@ -1224,21 +988,15 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
                 _clip_tracking_cache[tracking_id] = predicted_class
         
         del text_features
-        torch.cuda.empty_cache() if clip_device.type == 'cuda' else None
+        if clip_device.type == 'cuda':
+            torch.cuda.empty_cache()
     else:
         print(f"[HEURISTIC] Using heuristic-only classification for all {len(all_rois)} ROIs")
     
-    t_heur_end = time.time()
-    print(f"[TIMING] Heuristic filtering: {t_heur_end - t_heur_start:.3f}s")
-    # --- CLIP inference ---
-    t_clip_start = time.time()
-    t2 = time.time()
     if not all_rois:
-        t3 = time.time(); print(f"[TIMING] Unified CLIP call: {t3-t2:.3f}s")
         return [{"objects": []} for _ in frames]
 
-    # 3. RELAXED scoring and filtering - keep more objects
-    t4 = time.time()
+    # RELAXED scoring and filtering - keep more objects
     frame_results = [{"objects": []} for _ in frames]  # Pre-initialize with empty objects
     frame_label_count = [{} for _ in frames]
     
@@ -1263,9 +1021,6 @@ def batch_evaluate_frame_filter(frames: List[Dict], images: List[np.ndarray], ba
             frame_results[frame_idx]["objects"].append(bbox)
             frame_label_count[frame_idx][expected] = label_count + 1
     
-    t5 = time.time(); print(f"[TIMING] Assign results to frames: {t5-t4:.3f}s")
-    t_assign_end = time.time()
-    print(f"[TIMING] Total batch_evaluate_frame_filter: {time.time()-t0:.3f}s")
     t_end = time.time()
     print(f"[TIMING] batch_evaluate_frame_filter: total processing time = {t_end - t0:.3f}s")
     return frame_results

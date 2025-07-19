@@ -26,7 +26,7 @@ from miner.utils.video_downloader import download_video
 from supervision.tracker.byte_tracker.core import ByteTrack
 from supervision.detection.core import Detections
 from supervision.keypoint.core import KeyPoints
-from validator.evaluation.bbox_clip import batch_classify_rois as orig_batch_classify_rois, BoundingBoxObject, OBJECT_ID_TO_ENUM, BBoxScore, extract_regions_of_interest_from_image
+from validator.evaluation.bbox_clip import batch_classify_rois as orig_batch_classify_rois, BoundingBoxObject, OBJECT_ID_TO_ENUM, BBoxScore, extract_regions_of_interest_from_image, evaluate_frame as evaluate_frame_filter
 import torch
 from validator.evaluation.bbox_clip import batch_evaluate_frame_filter
 
@@ -51,6 +51,10 @@ def batch_classify_rois_gpu(regions_of_interest):
 logger = get_logger(__name__)
 
 CONFIG = SoccerPitchConfiguration()
+
+# Default configuration
+DEFAULT_FILTER_TYPE = 'batch'
+DEFAULT_FILTER_ENABLED = True
 
 # Global model manager instance
 model_manager = None
@@ -233,61 +237,84 @@ async def process_soccer_video(
                 tracking_data["frames"] = list(executor.map(filter_objects_clip_frame, args_list))
         t_clip_end = time.time()
         timings['clip_filtering'] = t_clip_end - t_clip_start
-        # 6. Generate keypoint và fake object (trên bbox đã scale)
-        t_fake_start = time.time()
-        min_frames_with_objects = int(0.7 * total_frames)
-        current_with_objects = len(frames_with_objects)
-        if current_with_objects < min_frames_with_objects:
-            need_to_add = min_frames_with_objects - current_with_objects
-            frames_to_add = empty_object_frame_ids[:need_to_add]
-            for frame_data in tracking_data["frames"]:
-                if frame_data["frame_number"] in frames_to_add and not frame_data["objects"]:
-                    import random
-                    num_fake_players = random.randint(5, 10)
-                    num_fake_refs = random.randint(1, 2)
-                    margin = 50
-                    fake_objects = []
-                    centers = []
-                    max_attempts = 100 * (num_fake_players + num_fake_refs)
-                    attempts = 0
-                    orig_width = 1920
-                    orig_height = 1080
-                    if "keypoints" in frame_data and frame_data["keypoints"]:
-                        xs = [pt[0] for pt in frame_data["keypoints"]]
-                        ys = [pt[1] for pt in frame_data["keypoints"]]
-                        if xs and ys:
-                            orig_width = int(max(xs)) + 1
-                            orig_height = int(max(ys)) + 1
-                    while len(fake_objects) < (num_fake_players + num_fake_refs) and attempts < max_attempts:
-                        x1 = random.uniform(margin, orig_width - margin - 60)
-                        y1 = random.uniform(margin, orig_height - margin - 120)
-                        w = random.uniform(30, 60)
-                        h = random.uniform(60, 120)
-                        x2 = min(x1 + w, orig_width - margin)
-                        y2 = min(y1 + h, orig_height - margin)
-                        cx = (x1 + x2) / 2
-                        cy = (y1 + y2) / 2
-                        too_close = any((abs(cx-cx2)**2 + abs(cy-cy2)**2)**0.5 < 50 for cx2, cy2 in centers)
-                        if not too_close:
-                            if len(fake_objects) < num_fake_players:
-                                class_id = 2  # Player
-                            else:
-                                class_id = 3  # Referee
-                            fake_objects.append({
-                                "id": len(fake_objects) + 1,
-                                "bbox": [x1, y1, x2, y2],
-                                "class_id": class_id
-                            })
-                            centers.append((cx, cy))
-                        attempts += 1
-                    frame_data["objects"] = fake_objects
-        t_fake_end = time.time()
-        timings['fake_object_generation'] = t_fake_end - t_fake_start
-        # 7. Generate keypoints (nên làm sau khi bbox đã scale)
-        for frame_data in tracking_data["frames"]:
-            orig_width, orig_height = frame_data["orig_shape"]
-            keypoints_list = generate_perfect_keypoints(video_width=orig_width, video_height=orig_height)
-            frame_data["keypoints"] = keypoints_list
+        
+        # 7. Enhanced pitch detection and keypoint generation
+        t_pitch_start = time.time()
+        
+        # Process pitch detection in batches to avoid model size limits
+        max_batch_size = 10  # Model max batch size
+        total_frames = len(tracking_data["frames"])
+        
+        for batch_start in range(0, total_frames, max_batch_size):
+            batch_end = min(batch_start + max_batch_size, total_frames)
+            batch_frames = tracking_data["frames"][batch_start:batch_end]
+            
+            # Collect ORIGINAL frames for this batch (better quality for pitch detection)
+            batch_images = []
+            for i, frame_data in enumerate(batch_frames):
+                # Get original frame from the frames list
+                frame_idx = batch_start + i
+                if frame_idx < len(frames):
+                    try:
+                        frame_tuple = frames[frame_idx]
+                        if isinstance(frame_tuple, (tuple, list)) and len(frame_tuple) >= 2:
+                            # Extract frame from tuple/list structure
+                            frame_number, original_frame = frame_tuple[0], frame_tuple[1]
+                            batch_images.append(original_frame)  # Use original high-res frame
+                        elif hasattr(frame_tuple, 'shape'):
+                            # Direct frame array
+                            batch_images.append(frame_tuple)
+                        else:
+                            # Fallback to resized frame if tuple structure is unexpected
+                            batch_images.append(frame_data["frame"])
+                    except Exception as e:
+                        print(f"Error accessing original frame at index {frame_idx}: {e}")
+                        # Fallback to resized frame
+                        batch_images.append(frame_data["frame"])
+                else:
+                    # Fallback to resized frame if original not available
+                    batch_images.append(frame_data["frame"])
+            
+            try:
+                # Run pitch model on this batch
+                print(f"Running pitch model on batch {batch_start}-{batch_end} with {len(batch_images)} images")
+                
+                pitch_results = pitch_model(batch_images, verbose=False)
+                
+                # Process keypoints for each frame in this batch (using simple working approach)
+                for i, frame_data in enumerate(batch_frames):
+                    # Extract pitch keypoints using the same working approach as soccer.py
+                    pitch_result = pitch_results[i]
+                    # print(f"Pitch result for frame {frame_data['frame_number']}: {pitch_result}")
+                    # print(pitch_result.boxes)
+                    try:
+                        # Check if pitch model actually has keypoints (not just detection boxes)
+                        if hasattr(pitch_result, 'keypoints') and pitch_result.keypoints is not None:
+                            # Pitch model has real keypoints - use supervision to extract them
+                            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
+                            keypoints_list = keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else []
+                            if keypoints_list:
+                                print(f"  Successfully extracted {len(keypoints_list)} keypoints from pitch model")
+                        else:
+                            # Pitch model only has detection boxes, no keypoints
+                            keypoints_list = []
+                            print(f"  Pitch model has {pitch_result.boxes.shape[0] if hasattr(pitch_result, 'boxes') and pitch_result.boxes is not None else 0} detections but no keypoints")
+                        
+                    except Exception as e:
+                        keypoints_list = []
+                        print(f"Error extracting keypoints for frame {frame_data['frame_number']}: {e}")
+                    
+                    # Store keypoints
+                    frame_data["keypoints"] = keypoints_list
+                        
+            except Exception as e:
+                print(f"Batch pitch detection failed for batch {batch_start}-{batch_end}: {e}")
+                # No fake keypoints - just empty lists for failed batch
+                for frame_data in batch_frames:
+                    frame_data["keypoints"] = []
+                
+        t_pitch_end = time.time()
+        timings['pitch_detection'] = t_pitch_end - t_pitch_start
         # 8. Result aggregation/cleanup
         t_agg_start = time.time()
         for frame_data in tracking_data["frames"]:
@@ -389,203 +416,4 @@ router.add_api_route(
     methods=["POST"],
 )
 
-def generate_perfect_keypoints(video_width, video_height):
-    import numpy as np
-    from sports.configs.soccer import SoccerPitchConfiguration
-    config = SoccerPitchConfiguration()
-    pitch_length = config.length
-    pitch_width = config.width
-    scale_x = video_width / pitch_length
-    scale_y = video_height / pitch_width
-    keypoints = []
-    for x, y in config.vertices:
-        x_pixel = x * scale_x
-        y_pixel = y * scale_y
-        keypoints.append([x_pixel, y_pixel])
-    keypoints_np = np.array(keypoints)
-    center = keypoints_np.mean(axis=0)
-
-    # Bước 1: Xoay quanh tâm sân - tối ưu hóa góc xoay
-    angle_rad = np.deg2rad(0.4)  # Giảm xuống 0.4° để ít biến dạng nhất
-    rotation_matrix = np.array([
-        [np.cos(angle_rad), -np.sin(angle_rad)],
-        [np.sin(angle_rad),  np.cos(angle_rad)]
-    ])
-    shifted = keypoints_np - center
-    rotated = shifted @ rotation_matrix.T
-    rotated_keypoints = rotated + center
-
-    # Bước 2: Biến đổi phối cảnh tối ưu hóa
-    perspective_factor = 0.04  # Giảm xuống 0.04
-    y_min = rotated_keypoints[:, 1].min()
-    y_max = rotated_keypoints[:, 1].max()
-    y_range = y_max - y_min
-    
-    # Zoom factor tối ưu để tăng độ chính xác
-    zoom_factor = 0.76  # Thu nhỏ thêm để tăng margin
-    rotated_keypoints = center + (rotated_keypoints - center) * zoom_factor
-    
-    # Đảm bảo luôn là numpy array để tránh lỗi linter khi gán giá trị
-    rotated_keypoints = np.asarray(rotated_keypoints)
-    
-    # Áp dụng perspective transformation với độ chính xác cao hơn
-    for i in range(len(rotated_keypoints)):
-        y = rotated_keypoints[i][1]
-        ratio = (y_max - y) / y_range
-        
-        # Horizontal perspective với độ chính xác cao
-        horizontal_shift = (rotated_keypoints[i][0] - center[0]) * (1 - perspective_factor * ratio)
-        rotated_keypoints[i, 0] = center[0] + horizontal_shift
-        
-        # Vertical perspective nhẹ để tăng độ tự nhiên
-        vertical_perspective = 0.0008  # Giảm xuống 0.0008
-        rotated_keypoints[i, 1] = y + (y - center[1]) * vertical_perspective * ratio
-
-    # Bước 3: Tối ưu hóa noise pattern theo từng loại keypoint
-    # Phân loại keypoints theo vị trí trên sân
-    corner_keypoints = [0, 5, 6, 11, 12, 17, 18, 23, 24, 29, 30]  # Các góc sân
-    center_keypoints = [14, 15, 16, 31, 32]  # Điểm giữa sân
-    side_keypoints = [1, 2, 3, 4, 7, 8, 9, 10, 13, 19, 20, 21, 22, 25, 26, 27, 28]  # Các điểm bên
-    
-    # Noise khác nhau cho từng loại keypoint - tối ưu hóa thêm
-    corner_noise_std = 0.15   # Góc sân ít noise hơn vì dễ detect
-    center_noise_std = 0.3    # Điểm giữa noise trung bình
-    side_noise_std = 0.5      # Điểm bên noise cao hơn
-    
-    correlated_noise = np.zeros_like(rotated_keypoints)
-    
-    # Áp dụng noise theo loại keypoint
-    for i in range(len(rotated_keypoints)):
-        if i in corner_keypoints:
-            noise_std = corner_noise_std
-        elif i in center_keypoints:
-            noise_std = center_noise_std
-        else:
-            noise_std = side_noise_std
-        
-        # Tính khoảng cách đến các keypoints khác
-        distances = np.linalg.norm(rotated_keypoints - rotated_keypoints[i], axis=1)
-        # Keypoints gần nhau có noise tương tự
-        correlation_weight = np.exp(-distances / 25)  # Giảm decay factor
-        correlated_noise[i] = np.random.normal(0, noise_std, 2)
-        
-        # Áp dụng spatial correlation
-        if np.sum(correlation_weight) > 0:
-            correlated_noise[i] = np.average(correlated_noise, weights=correlation_weight, axis=0)
-    
-    rotated_keypoints += correlated_noise
-    
-    # Bước 4: Cải thiện boundary handling
-    # Đảm bảo keypoints không quá sát biên
-    margin = 45  # Tăng margin lên 45 pixels
-    rotated_keypoints[:, 0] = np.clip(rotated_keypoints[:, 0], margin, video_width - margin)
-    rotated_keypoints[:, 1] = np.clip(rotated_keypoints[:, 1], margin, video_height - margin)
-    
-    # Bước 5: Tối ưu hóa geometric consistency
-    # Đảm bảo tỷ lệ khung hình sân bóng được bảo toàn
-    original_aspect_ratio = pitch_length / pitch_width
-    current_aspect_ratio = (rotated_keypoints[:, 0].max() - rotated_keypoints[:, 0].min()) / \
-                          (rotated_keypoints[:, 1].max() - rotated_keypoints[:, 1].min())
-    
-    # Điều chỉnh nhẹ để duy trì tỷ lệ
-    if abs(current_aspect_ratio - original_aspect_ratio) > 0.006:  # Giảm threshold
-        scale_factor = np.sqrt(original_aspect_ratio / current_aspect_ratio)
-        rotated_keypoints = center + (rotated_keypoints - center) * scale_factor
-    
-    # Bước 6: Tối ưu hóa keypoint distribution
-    # Đảm bảo keypoints phân bố đều trên sân
-    x_coords = rotated_keypoints[:, 0]
-    y_coords = rotated_keypoints[:, 1]
-    
-    # Tính độ phân tán của keypoints
-    x_std = np.std(x_coords)
-    y_std = np.std(y_coords)
-    
-    # Nếu phân tán quá ít, tăng nhẹ
-    min_std_threshold = video_width * 0.17  # 17% của width
-    if x_std < min_std_threshold or y_std < min_std_threshold:
-        expansion_factor = 1.002  # Giảm expansion factor
-        rotated_keypoints = center + (rotated_keypoints - center) * expansion_factor
-    
-    # Bước 7: Fine-tuning precision
-    # Đảm bảo keypoints có độ chính xác cao
-    rotated_keypoints[:, 0] = np.clip(rotated_keypoints[:, 0], margin, video_width - margin)
-    rotated_keypoints[:, 1] = np.clip(rotated_keypoints[:, 1], margin, video_height - margin)
-    
-    # Round to 1 decimal place để tăng precision
-    rotated_keypoints = np.round(rotated_keypoints, 1)
-    
-    # Bước 8: Final validation và optimization
-    # Kiểm tra xem có keypoint nào bị trùng lặp không
-    unique_keypoints = np.unique(rotated_keypoints.round(0), axis=0)
-    if len(unique_keypoints) < len(rotated_keypoints):
-        # Nếu có trùng lặp, thêm noise nhỏ
-        small_noise = np.random.normal(0, 0.08, rotated_keypoints.shape)  # Giảm noise
-        rotated_keypoints += small_noise
-        rotated_keypoints = np.round(rotated_keypoints, 1)
-    
-    # Bước 9: Final geometric optimization
-    # Đảm bảo keypoints tuân thủ các ràng buộc hình học của sân bóng
-    # Tính khoảng cách giữa các keypoints liền kề
-    edges = config.edges
-    for edge in edges:
-        if len(edge) == 2:
-            idx1, idx2 = edge[0] - 1, edge[1] - 1  # Convert to 0-based indexing
-            if idx1 < len(rotated_keypoints) and idx2 < len(rotated_keypoints):
-                # Đảm bảo khoảng cách hợp lý giữa các keypoints liền kề
-                distance = np.linalg.norm(rotated_keypoints[idx1] - rotated_keypoints[idx2])
-                min_distance = 45  # Tăng minimum distance
-                if distance < min_distance:
-                    # Điều chỉnh vị trí để tăng khoảng cách
-                    direction = (rotated_keypoints[idx2] - rotated_keypoints[idx1]) / distance
-                    adjustment = (min_distance - distance) / 2
-                    rotated_keypoints[idx1] -= direction * adjustment
-                    rotated_keypoints[idx2] += direction * adjustment
-    
-    # Bước 10: Temporal consistency optimization
-    # Đảm bảo keypoints có tính ổn định cao qua các frame
-    # Thêm một chút noise có tính hệ thống để mô phỏng độ không chính xác thực tế
-    systematic_noise = np.random.normal(0, 0.04, rotated_keypoints.shape)  # Giảm systematic noise
-    rotated_keypoints += systematic_noise
-    
-    # Bước 11: Advanced geometric optimization
-    # Tối ưu hóa vị trí keypoints dựa trên cấu trúc sân bóng
-    # Đảm bảo các keypoints ở góc sân có vị trí chính xác
-    corner_indices = [0, 5, 6, 11, 12, 17, 18, 23, 24, 29, 30]
-    for idx in corner_indices:
-        if idx < len(rotated_keypoints):
-            x, y = rotated_keypoints[idx]
-            # Điều chỉnh nhẹ để đảm bảo góc sân nằm ở vị trí hợp lý
-            if x < video_width * 0.1 or x > video_width * 0.9:
-                rotated_keypoints[idx, 0] = np.clip(x, margin, video_width - margin)
-            if y < video_height * 0.1 or y > video_height * 0.9:
-                rotated_keypoints[idx, 1] = np.clip(y, margin, video_height - margin)
-    
-    # Bước 12: Final boundary check và precision optimization
-    rotated_keypoints[:, 0] = np.clip(rotated_keypoints[:, 0], margin, video_width - margin)
-    rotated_keypoints[:, 1] = np.clip(rotated_keypoints[:, 1], margin, video_height - margin)
-    rotated_keypoints = np.round(rotated_keypoints, 1)
-    
-    # Bước 13: Final validation - đảm bảo tất cả keypoints đều hợp lệ
-    # Kiểm tra xem có keypoint nào bị trùng lặp không
-    unique_keypoints = np.unique(rotated_keypoints.round(0), axis=0)
-    if len(unique_keypoints) < len(rotated_keypoints):
-        # Nếu có trùng lặp, thêm noise nhỏ
-        small_noise = np.random.normal(0, 0.05, rotated_keypoints.shape)
-        rotated_keypoints += small_noise
-        rotated_keypoints = np.round(rotated_keypoints, 1)
-    
-    # Bước 14: Ultra-fine optimization
-    # Tối ưu hóa cuối cùng để đạt độ chính xác tối đa
-    # Đảm bảo keypoints có vị trí tối ưu cho RANSAC
-    for i in range(len(rotated_keypoints)):
-        # Thêm một chút điều chỉnh nhỏ để tối ưu hóa vị trí
-        adjustment = np.random.normal(0, 0.02, 2)
-        rotated_keypoints[i] += adjustment
-    
-    # Final boundary check
-    rotated_keypoints[:, 0] = np.clip(rotated_keypoints[:, 0], margin, video_width - margin)
-    rotated_keypoints[:, 1] = np.clip(rotated_keypoints[:, 1], margin, video_height - margin)
-    rotated_keypoints = np.round(rotated_keypoints, 1)
-
-    return rotated_keypoints.tolist()
+# Function removed - replaced with real pitch detection
